@@ -8,6 +8,10 @@ from collections import Counter
 from typing import Optional, Dict, Tuple
 
 import numpy as np
+from olmo import tokenizer
+
+from olmo import tokenizer
+from olmo.config import BaseConfig
 
 GENERAL_PROMPTS_V1 = {
     "short_answer": [
@@ -111,7 +115,7 @@ GENERAL_PROMPTS_V1 = {
         "Help me answer this question: \"{question}\", by stating which of the following options is correct\n{options}."
     ],
     "pointing": [
-        "Point to {label}\nPlease say 'This isn't in the image.' if it is not in the image.",
+        "Point to {label}\nPlease say 'There are none.' if it is not in the image.",
         "Point to all occurrences of \"{label}\"",
         "Point to any {label} in the image",
         "Point to any {label} in the image.",
@@ -191,7 +195,7 @@ GENERAL_PROMPTS_V1 = {
         "In all the picture, how many {label} are there?",
         "Point at the {label} and then count them.",
         "Point to all the visible {label} output the total count.",
-        "Point to all the {label} visible and output the total count. \nPlease say 'This isn't in the image.' if it is not in the image.",
+        "Point to all the {label} visible and output the total count. \nPlease say 'There are none.' if it is not in the image.",
         "Point to all occurrences of \"{label}\" and output the total count.",
         "Show me where the {label} are and output the total count.",
         "Where are the {label}? How many are there?",
@@ -211,7 +215,7 @@ GENERAL_PROMPTS_V1 = {
         "Can you count every {label} in the picture?",
         "Can you see any {label} in the image? How many are there?",
         "Are there any {label} in the image? How many are there?",
-        "If you see any {label} in the image, give me the count. Otherwise, say 'This isn't in the image.'",
+        "If you see any {label} in the image, give me the count. Otherwise, say 'There are none.'",
         "Object: {label}\nInstruction: How many are there?",
     ],
     "count_then_point": [
@@ -221,7 +225,6 @@ GENERAL_PROMPTS_V1 = {
         "Locate the {label} and count them, then point to them.",
         "Find all the {label}. How many are there? Point to them.",
         "Find each {label}. How many are there? Point to them.",
-        "Point to and count the {label} in the picture.",
     ],
     "only_count": [
         "Count the {label} in the image.",
@@ -231,6 +234,9 @@ GENERAL_PROMPTS_V1 = {
         "Find all the {label}. How many are there?",
         "Find each {label}. How many are there?",
     ],
+    "chain_of_thought": [
+        "{question} Provide reasoning steps and then give the short answer.",
+    ]
 }
 
 
@@ -289,13 +295,15 @@ def apply_keyword_prompt(prompts, example, rng, keywords=None, dbg=False):
 DEMO_STYLES = [
     "point_count",
     "pointing",
+    "cosyn_point",
     "user_qa",
     "long_caption",
+    "short_caption",
 ]
 
 
 @dataclasses.dataclass
-class DataFormatter:
+class DataFormatter(BaseConfig):
     """Applies prompt templates and adds system prompts to construct text inputs/output"""
     prompt_templates: str = "none"  # How to template prompts for examples
     message_format: str = "none"  # How to format messages
@@ -304,6 +312,7 @@ class DataFormatter:
     default_inference_len: int = 65  # Inference len for length-conditioned prompting
     select_answer: str = "best"  # How to select answer for questions with many answers
     debug: bool = False  # deterministic mode for debugging
+    image_last: bool = False
 
     def points_to_text(self, points, scale, label_text, alt_text):
         if isinstance(scale, (tuple, list)):
@@ -407,7 +416,6 @@ class DataFormatter:
         return out
 
     def get_system_prompt(self, style, for_inference, messages, rng):
-
         # For eval only dataset
         if style == "eval_short_answer":
             style = "vqa2"
@@ -427,22 +435,32 @@ class DataFormatter:
             else:
                 prefix = style + ":"
 
-        elif for_inference and self.system_prompt == "style_and_length":
+        elif for_inference and self.system_prompt in ["style_and_length", "style_and_length_v2"]:
             v2 = self.system_prompt == "style_and_length_v2"
             inference_len = self.default_inference_len
             n = None if inference_len is None else str(inference_len)
             if n is not None and len(n) > 0:  # allow empty string to signal unconditioned
                 prefix = style + " " + n + ":"
             else:
-                prefix = style + " :"  # FIXME remove the space
-        elif self.system_prompt == "style_and_length":
+                if self.system_prompt in ["style_and_length_v2"]:
+                    prefix = style + ":"
+                else:
+                    prefix = style + " :"
+        elif self.system_prompt in ["style_and_length", "style_and_length_v2"]:
             std = 25
             if rng.random() > 0.10:
                 n = len(messages[-1])
                 n += int(rng.normal(scale=std))
-                prefix = style + " " + str(n//15) + ":"
+                n = n // 15
             else:
-                prefix = style + " :"  # FIXME remove the space
+                n = None
+            if n is not None:
+                prefix = style + " " + str(n) + ":"
+            else:
+                if self.system_prompt in ["style_and_length_v2"]:
+                    prefix = style + ":"
+                else:
+                    prefix = style + " :"
         else:
             raise NotImplementedError(self.system_prompt)
 
@@ -490,8 +508,13 @@ class DataFormatter:
             else:
                 # We template long captions and pointing since they are "demo" tasks, and use
                 # plain text for everything else
-                if style == "long_caption":
-                    prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["long_caption"], example, rng, dbg=self.debug)
+                if style in ["long_caption", "short_caption"] and "question" not in example:
+                    prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[style], example, rng, dbg=self.debug)
+                elif "_exp" in style:
+                    prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["chain_of_thought"], example, rng, dbg=self.debug)
+                elif style == "cosyn_point":
+                    prompt = example["question"]
+                    output = self.format_points(example)
                 elif style in ["pointing", "point_count"]:
                     # output, prompt, metadata = self.format_points(example)
                     if "question" in example:
@@ -521,6 +544,8 @@ class DataFormatter:
                 output = example["answer"]
                 if "answer_annotations" in example:
                     output = self.format_annotated_text(output, example["answer_annotations"])
+                elif "explanation" in example:
+                    output = example["explanation"] + " Answer: " + output
             elif "answer_with_points" in example:
                 output = example["answer_with_points"]
             elif "text" in example:
@@ -571,12 +596,20 @@ class DataFormatter:
                 with_system_prompt = messages[0]
             messages = [with_system_prompt] + messages[1:]
 
+        if (
+            self.image_last and
+            "image" in example and
+            tokenizer.IMAGE_PROMPT not in messages[0]
+        ):
+            messages[0] = messages[0] + tokenizer.IMAGE_PROMPT
+
         # Add the role annotations such as "User:" and "Assistant:"
         messages = self.format_messages(messages)
         return messages, metadata
 
     def __call__(self, ex: Dict, is_training, for_inference, rng) -> Tuple[Dict, Dict]:
         """Returns a formatted example and example metadata"""
+
         if "message_list" in ex:
             # Does not support returning metadata, which is fine since we are not doing inference
             return [self._format_example(msg, ex, is_training, for_inference, rng)[0]

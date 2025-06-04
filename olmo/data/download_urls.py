@@ -23,7 +23,7 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
 from olmo.data.dataset import DATA_HOME
-from olmo.data.model_preprocessor import setup_pil
+from olmo.models.molmo.model_preprocessor import setup_pil
 
 if "PIXMO_IMAGE_DIR" in os.environ:
     PIXMO_IMAGES = os.environ["PIXMO_IMAGE_DIR"]

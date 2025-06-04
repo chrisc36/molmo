@@ -29,8 +29,16 @@ Here is a **[video demo](https://www.youtube.com/watch?v=spBxYa3eAlA)** of Molmo
 This codebase is based on the [OLMo codebase](https://github.com/allenai/OLMo) with the addition
 of vision encoding and integrating generative evaluations.
 
-## Release Notes
+This is a development branch containing improved code and support for the HF trainer.
 
+## Release Notes
+- 
+- [2025/06/04] **Molmo**: updated and improved code for Molmo, include:
+  - Support for SiglIP 2, Qwen2.5, and OLMo 2.
+  - Ability to train with the HuggingfaceTrainer
+  - Evaluating HF models directly without converting them to our model format
+  - Improved code, including refactored configuration setup and simplified pre-preprocessing.
+  
 - [2024/12/05] **🔥 Molmo**: code for modeling, training and evaluation has been released. You can find detailed technical report [here](https://arxiv.org/pdf/2409.17146).
 
 - [2024/11/27] **🔥 [PixMo](https://huggingface.co/collections/allenai/pixmo-674746ea613028006285687b)**, our new collection of datasets for pre-training and fine-tuning VLMs, has been released. PixMo consists of:

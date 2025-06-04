@@ -2,8 +2,6 @@ import argparse
 import json
 from collections import Counter
 
-import  tensorflow.io.gfile as gfile
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -12,7 +10,7 @@ def main():
     parser.add_argument("--format", choices=["vqa2", "doc_qa"], default="vqa2")
     args = parser.parse_args()
 
-    with gfile.GFile(args.source, "r") as f:
+    with open(args.source, "r") as f:
         data = json.load(f)
 
     converted = []
@@ -29,7 +27,7 @@ def main():
             converted.append(dict(answer=pred, questionId=ex["example_id"]))
 
     print(len(converted))
-    with gfile.GFile(args.output, "w") as f:
+    with open(args.output, "w") as f:
         json.dump(converted, f)
 
 

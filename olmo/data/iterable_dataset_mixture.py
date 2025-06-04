@@ -55,7 +55,7 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
             total = counts.sum()
             for _ in range(self.global_batch_size):
                 # Sample the most under-represented dataset
-                ix = np.argmax(np.abs(counts/total - self.mixture_rates))
+                ix = np.argmax(self.mixture_rates - counts/total)
                 out.append(ix)
                 counts[ix] += 1
                 total += 1
@@ -74,7 +74,10 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
 
         # How often each dataset has been sampled globally across all devices/workers
         counts = np.zeros(len(self.datasets), dtype=np.int64)
+
         if self.start_index != 0:
+            # Fast forward by re-computing what to sample (so the RNG state updates) but
+            # without actually requesting the data from the data loader
             assert self.start_index % self.global_batch_size == 0
             start_batch = self.start_index // self.global_batch_size
             if worker_info is None:
@@ -104,8 +107,6 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
 
                 if (i + self.rank) % self.world_size != 0:
                     continue
-                device_ix = (i + self.rank) // self.world_size
-
                 dataset = self.datasets[dataset_ix]
                 epoch = count // len(dataset)
 
