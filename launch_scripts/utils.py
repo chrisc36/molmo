@@ -5,7 +5,6 @@ from dataclasses import replace
 from olmo.models.molmo.data_formatter import DataFormatter
 from olmo.models.molmo.model_preprocessor import MolmoPreprocessorConfig
 from olmo.data.data_loader import DataLoaderConfig, HFDataLoaderConfig
-from olmo.models.video_olmo.video_olmo import VideoOlmoConfig, MultiModalVideoPreprocessorConfig
 from olmo.eval.inf_evaluator import InfDatasetEvaluatorConfig, EvaluatorConfig
 from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.nn.image_vit import VitConfig
@@ -41,20 +40,6 @@ DEBUG_MODEL = MolmoConfig(
     ),
     data_formatter=DataFormatter(),
     mm_preprocessor=MolmoPreprocessorConfig(crop_mode="resize", max_crops=1)
-)
-
-
-VIDEO_DEBUG_MODEL = VideoOlmoConfig(
-    llm=DEBUG_MODEL.llm,
-    vision_backbone=MolmoVisionBackboneConfig(vit=VitConfig(image_num_layers=1)),
-    data_formatter=DEBUG_MODEL.data_formatter,
-    mm_preprocessor=MultiModalVideoPreprocessorConfig(
-        crop_mode="resize",
-        pooling_h=2,
-        pooling_w=2,
-        max_frames=4,
-        max_crops=1
-    )
 )
 
 
@@ -95,27 +80,7 @@ def get_evaluator(name) -> EvaluatorConfig:
         return EvaluatorConfig(clock_bench_eval=True)
     elif name in ["countbench_qa"]:
         return EvaluatorConfig(count_eval=True)
-    elif name in ["mvbench", "llava_video_178k_mc", "mlvu_mc"]: # expects a single character followed by a dot.
-        return EvaluatorConfig(vqa_eval="em_start")
-    elif name.startswith("temp_compass"):
-        disable_api = "disable_api" in name
-        name = name.replace("_disable_api", "")
-        task = '_'.join(name.split("_")[2:]) if len(name.split("_")) > 2 else "all"
-        return EvaluatorConfig(temp_compass_eval=task, temp_compass_disable_api=disable_api)
-    elif name == "mlvu_gen":
-        return EvaluatorConfig(mlvu_gen_eval=True)
-    elif name == "ego_schema":
-        return EvaluatorConfig(vqa_eval="ego_schema_mc")
-    elif name == "perception_test":
-        return EvaluatorConfig(vqa_eval="perception_test_mc")
-    elif name.startswith("video_mme"):
-        duration = "all" if len(name.split("_")) == 2 else name.split("_")[2]
-        return EvaluatorConfig(video_mme_eval=duration)
-    elif name == "long_video_bench":
-        return EvaluatorConfig(long_video_bench_eval=True)
-    elif name == "nextqa_mc":
-        return EvaluatorConfig(vqa_eval="nextqa_mc")
-    elif name in ["dense_caption_eval", "user_qa", "vqa_v2_test", "intern_vid"]:
+    elif name in ["dense_caption_eval", "user_qa"]:
         # No metrics, but still save prediction file
         return EvaluatorConfig()
     else:

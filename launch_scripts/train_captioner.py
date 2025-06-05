@@ -103,7 +103,7 @@ if __name__ == "__main__":
             persistent_workers=True,
         ),
     )
-    duration_factor = 4
+
 
     cfg = TrainConfig(
         save_folder="debug_run" if debug else omegaconf.MISSING,
@@ -152,16 +152,11 @@ if __name__ == "__main__":
         ),
         scheduler=SchedulerConfig(
             name=SchedulerType.multimodal,
-            connector_t_warmup=200//duration_factor,
-            vit_t_warmup=2000//duration_factor,
-            llm_t_warmup=2000//duration_factor,
+            connector_t_warmup=200,
+            vit_t_warmup=2000,
+            llm_t_warmup=2000,
             alpha_f=0.1,
             warmup_min_lr=0.0
-        ),
-        fsdp=FSDPConfig(
-            use_orig_params=True,
-            wrapping_strategy=FSDPWrapStrategy.by_block_and_size,
-            precision=FSDPPrecision.float
         ),
         load_path=None,
         initial_model_checkpoint=None,
@@ -173,7 +168,7 @@ if __name__ == "__main__":
         global_train_batch_size=global_batch_size,
         device_train_microbatch_size=4,
         time_limit=None,
-        max_duration=duration//duration_factor,
+        max_duration=duration,
         stop_at="${max_duration}",
         max_grad_norm=1,
         batch_divisor=BatchDivisor.global_batch,

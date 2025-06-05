@@ -55,7 +55,7 @@ def main():
             args.max_crops = 24 if args.max_crops is None else args.max_crops
         else:
             args.max_crops = 36 if args.max_crops is None else args.max_crops
-        args.seq_len = 8192
+        args.seq_len = 6144
         args.eval_name = f"{args.max_crops}crop"
 
     tasks = []
