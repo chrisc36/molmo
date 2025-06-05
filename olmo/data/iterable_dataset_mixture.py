@@ -1,11 +1,12 @@
 import dataclasses
 import logging
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Union
 
 import numpy as np
 import torch
 
 from olmo.data.dataset import DeterministicDataset
+from olmo.hf_train.dataset import HFDeterministicDataset
 from olmo.torch_util import get_world_size, get_global_rank
 
 log = logging.getLogger(__name__)
@@ -16,7 +17,7 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
 
     def __init__(
         self,
-        datasets: List[DeterministicDataset],
+        datasets: List[Union[DeterministicDataset, HFDeterministicDataset]],
         global_batch_size: int,
         mixture_rates: List[float]=None,
         seed: int = 0,

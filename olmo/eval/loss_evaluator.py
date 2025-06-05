@@ -233,9 +233,9 @@ class LossDatasetEvaluatorConfig(BaseConfig):
             console_log_interval=self.console_log_interval
         )
     
-    def build_hf_dataset_evaluator(self, processor, model_config: MolmoConfig, device, **kwargs) -> LossDatasetEvaluator:
+    def build_hf_dataset_evaluator(self, processor, device, **kwargs) -> LossDatasetEvaluator:
         eval_loader = self.data.build_eval_dataloader(
-            model_config, self.device_batch_size, preprocessor=processor, for_inference=False)
+            self.device_batch_size, preprocessor=processor, for_inference=False)
         if self.max_examples is not None:
             num_batches = max(1, self.max_examples // (self.device_batch_size*get_world_size()))
         elif self.subset_num_batches is not None:

@@ -4,7 +4,8 @@ from dataclasses import replace
 
 from olmo.models.molmo.data_formatter import DataFormatter
 from olmo.models.molmo.model_preprocessor import MolmoPreprocessorConfig
-from olmo.data.data_loader import DataLoaderConfig, HFDataLoaderConfig
+from olmo.data.data_loader import DataLoaderConfig
+from olmo.hf_train.data_loader import HFDataLoaderConfig
 from olmo.eval.inf_evaluator import InfDatasetEvaluatorConfig, EvaluatorConfig
 from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.nn.image_vit import VitConfig

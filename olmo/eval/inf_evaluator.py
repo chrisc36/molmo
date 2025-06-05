@@ -386,7 +386,6 @@ class InfDatasetEvaluatorConfig(BaseConfig):
     def build_hf_dataset_evaluator(
         self,
         processor,
-        model_config,
         default_save_dir,
         device,
     ) -> InfDatasetEvaluator:
@@ -399,19 +398,12 @@ class InfDatasetEvaluatorConfig(BaseConfig):
             max_steps = None
 
         eval_loader = self.data.build_eval_dataloader(
-            model_config,
             self.device_batch_size,
             preprocessor=processor,
             for_inference=True,
             pad_batches=True,
             max_steps_for_padding=max_steps,
         )
-        if self.max_examples is not None:
-            num_batches = self.max_examples // self.device_batch_size*get_world_size()
-        elif self.subset_num_batches is not None:
-            num_batches = self.subset_num_batches
-        else:
-            num_batches = len(eval_loader)
 
         return InfDatasetEvaluator(
             label=self.label,

@@ -31,7 +31,7 @@ from olmo.hf_models.processing import *
 from olmo.hf_models.molmoe.vision import VisionBackboneConfig
 from olmo.hf_models.molmoe.vision_utils import VISION_BACKBONES
 
-from olmo.data.data_loader import HFDataLoaderConfig
+from olmo.hf_train.data_loader import HFDataLoaderConfig
 from olmo.torch_util import get_world_size
 from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.nn.vision_backbone import ImagePaddingEmbed

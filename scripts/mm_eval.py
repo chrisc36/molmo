@@ -132,7 +132,7 @@ class DatasetEvaluatorConfig(BaseConfig):
                 console_log_interval=console_log_interval
             )
             return cfg.build_hf_dataset_evaluator(
-                processor=processor, model_config=model_config, device=device, default_save_dir=default_save_dir)
+                processor=processor, device=device, default_save_dir=default_save_dir)
         else:
             cfg = LossDatasetEvaluatorConfig(
                 self.label, self.data,

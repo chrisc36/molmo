@@ -58,35 +58,42 @@ else:
     VIDEO_DATA_HOME = None
 
 
-class Dataset:
-    @classmethod
-    def download(cls, n_procs=1):
-        raise NotImplementedError()
-
-    def __len__(self):
-        raise NotImplementedError()
-
-    def __getitem__(self, item):
-        return self.get(item, np.random)
-
-    def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
-
-    def get(self, item, rng):
-        # `rng` is used to support deterministic data augmentation for tasks that require it.
-        # Used to avoid the hazards of relying on the global rng state for determinism
-        raise NotImplementedError()
-
-
-class DeterministicDataset:
+class HFDeterministicDataset:
     """Dataset wrapper that supports padding and control the random seed based on the epoch"""
 
-    def __init__(self, dataset: Dataset, preprocessor, seed, n_pad=0, for_inference=None):
+    def __init__(self, dataset, preprocessor, seed, n_pad=0, for_inference=None):
         self.dataset = dataset
         self.preprocessor = preprocessor
         self.seed = seed
         self.n_pad = n_pad
+
+        # formatting for hf models
+        if not hasattr(self.preprocessor, "formater"):
+            if not hasattr(self.preprocessor, "data_formatter_cfg"):
+                self.formater = DataFormatter(prompt_templates='uber_model',
+                                message_format='role',
+                                system_prompt='demo_or_style',
+                                always_start_with_space=True,
+                                default_inference_len=65,
+                                select_answer='best',
+                                debug=False,
+                                image_last=False)
+                self.is_training = False
+                self.for_inference = True
+            else:
+                data_formatter_cfg = copy.deepcopy(self.preprocessor.data_formatter_cfg)
+                self.is_hf_model = data_formatter_cfg.pop("is_hf_model", True)
+                assert self.is_hf_model, "are you sure this is not an HF model?"
+                self.is_training = data_formatter_cfg.pop("is_training", False)
+                if self.is_training:
+                    self.for_inference = False
+                else:
+                    self.for_inference = True
+                self.formater = DataFormatter(**data_formatter_cfg)
+
+        if for_inference is not None:
+            self.for_inference = for_inference
+            self.is_training = not for_inference
     
     def __len__(self):
         return len(self.dataset) + self.n_pad
@@ -101,6 +108,7 @@ class DeterministicDataset:
     def get(self, idx, epoch=0):
         rng = np.random.RandomState(
             (self.seed * 195172 + idx + len(self.dataset)*epoch) % (2 ** 32 - 1))
+        
         if idx >= len(self.dataset):
             # Padding example
             item = self.dataset.get(0, rng)
@@ -109,27 +117,44 @@ class DeterministicDataset:
             item["metadata"]["valid"] = False
         else:
             item = self.dataset.get(idx, rng) 
-        if self.preprocessor:
-            item = self.preprocessor(item, rng)
-        return item
+        
+        if "image" in item:
+            try:
+                image = load_image(item["image"])
+            except Exception as e:
+                raise ValueError(f"Could not load image: {item['image']}")
+            else:
+                item["image"] = image
+        else:
+            image = None
+        
+        metadata = item.get("metadata")
+        if metadata is None:
+            metadata = {}
+        if "image_size" not in metadata and image is not None:
+            metadata["image_size"] = image.size
+        
+        messages, formatter_metadata = self.formater(item, self.is_training, self.for_inference, rng)
 
-class DatasetBase(Dataset):
-    def __init__(self, split, sample: int=None):
-        super().__init__()
-        self.split = split
-        self.sample = sample
-        self.data = self.load()[:self.sample]
+        if isinstance(messages[0], list):
+            # If there are multiple conversations for this example, shuffle their order
+            # This might matter if we truncate the tokens to a max sequence length
+            rng.shuffle(messages)
 
-    def load(self):
-        raise NotImplementedError()
-
-    def __len__(self):
-        if self.data is None:
-            raise ValueError("Dataset not loaded")
-        return len(self.data)
-
-    def __getitem__(self, item):
-        return self.get(item, np.random)
-
-    def get(self, item, rng):
-        raise NotImplementedError()
+        if formatter_metadata:
+            metadata.update(formatter_metadata)
+     
+        item = self.preprocessor.process(
+                images=[image],
+                text=messages,
+                is_train=self.is_training,
+                message_format=self.formater.message_format,
+                always_start_with_space=self.formater.always_start_with_space,
+                rng=rng,
+            )
+            
+        if "image_token_indices" in item:
+            metadata["image_token_indices"] = item.pop("image_token_indices")
+            
+        item["metadata"] = metadata
+        return [item]

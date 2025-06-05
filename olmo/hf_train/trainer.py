@@ -1932,7 +1932,7 @@ class Trainer:
         from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
         if not isinstance(self.evaluators[0], LossDatasetEvaluatorConfig):
             self._eval_tokenizer.tokenizer.padding_side = "left"
-        self.evaluators = [v.build_hf_dataset_evaluator(self._eval_tokenizer, None, device=self.model.device, default_save_dir=None) for v in self.evaluators]
+        self.evaluators = [v.build_hf_dataset_evaluator(self._eval_tokenizer, device=self.model.device, default_save_dir=None) for v in self.evaluators]
         if args.push_to_hub:
             try:
                 # Disable progress bars when uploading models during checkpoints to avoid polluting stdout
