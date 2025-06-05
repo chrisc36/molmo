@@ -4,7 +4,6 @@ import re
 from typing import Optional, Any, List, Union, Dict
 
 import numpy as np
-from olmo import tokenizer
 
 
 ATTEND_ALL_SUBSEGMENT_ID = 10000
@@ -285,7 +284,6 @@ class InterleavedTextPreprocessor:
 
         # Some sanity checks
         if not all(len(v) == len(input_tokens) for v in out.values()):
-            import pdb; pdb.set_trace()
             raise RuntimeError("Length mismatch")
         special_tokens = np.array([
             self.tokenizer.image_end_token_id,
