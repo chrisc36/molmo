@@ -23,22 +23,6 @@ class RootSizeMixture(BaseConfig):
     rate: float
     mixture: Dict[str, Optional[float]]
 
-
-@dataclass
-class DatasetWithKwargs(BaseConfig):
-    dataset_name: str
-    sampling_rate: Optional[float] = None
-    root_size_factor: Optional[float] = None
-    max_high_res: Optional[int] = None
-    min_high_res: Optional[int] = None
-
-    def get_kwargs(self):
-        if self.max_high_res is None:
-            return dict(max_high_res=self.max_high_res, min_high_res=self.min_high_res)
-        else:
-            return {}
-
-
 @dataclass
 class DataLoaderConfig(BaseConfig):
     """Configuration for a torch `DataLoader`"""
@@ -51,8 +35,6 @@ class DataLoaderConfig(BaseConfig):
 
     root_size_mixture: Optional[List[RootSizeMixture]] = None
     """Mixture-of-mixtures where sub-mixtures rates are determined by the root dataset size"""
-
-    kwargs_mixture: Optional[List[DatasetWithKwargs]] = None
 
     split: str = omegaconf.MISSING
     """Dataset split to load"""
@@ -175,21 +157,10 @@ class DataLoaderConfig(BaseConfig):
             rates = [1]
         else:
             mixture: Dict[str, Tuple[Dataset, float, Optional[Dict]]] = {}
-            if self.kwargs_mixture:
-                for task in self.kwargs_mixture:
-                    log.info(f"Loading train dataset {task.dataset_name}/{self.split}")
-                    dataset = get_dataset_by_name(task.dataset_name, self.split)
-                    if task.sampling_rate is not None:
-                        size = task.sampling_rate
-                    elif task.root_size_factor < 1:
-                        size = np.sqrt(len(dataset) * task.sampling_rate)
-                    else:
-                        size = np.sqrt(task.root_size_factor)
-                    mixture[task.dataset_name] = (dataset, size, task.get_kwargs())
-            elif self.mixture:
+            if self.mixture:
                 for name, rate in self.mixture.items():
                     log.info(f"Loading train dataset {name}/{self.split}")
-                    mixture[name] = (get_dataset_by_name(name, self.split), rate, None)
+                    mixture[name] = (get_dataset_by_name(name, self.split), rate)
             else:
                 for root_size_mixture in self.root_size_mixture:
                     group_datasets = {}
@@ -204,15 +175,15 @@ class DataLoaderConfig(BaseConfig):
                             size = as_size
                         group_datasets[name] = (dataset, np.sqrt(size))
                     total_rate = sum(x[1] for x in group_datasets.values())
-                    mixture.update({name: (ds, r/total_rate*root_size_mixture.rate, None)
+                    mixture.update({name: (ds, r/total_rate*root_size_mixture.rate)
                                     for name, (ds, r) in group_datasets.items()})
 
             total_rate = sum(x[1] for x in mixture.values())
             mixture = sorted(mixture.items(), key=lambda x: x[0])
-            rates = [rate/total_rate for (_, (_, rate, _)) in mixture]
+            rates = [rate/total_rate for (_, (_, rate)) in mixture]
             datasets = []
-            for _, (dataset, _, kwargs) in mixture:
-                datasets.append(DeterministicDataset(dataset, preprocessor, self.seed, preprocessor_kwargs=kwargs))
+            for _, (dataset, _) in mixture:
+                datasets.append(DeterministicDataset(dataset, preprocessor, self.seed))
             log.info("Sampling rates:")
             names = list(x[0] for x in mixture)
             for ix in np.argsort(rates)[::-1]:
