@@ -56,4 +56,3 @@ site/
 /wandb/
 /scratch/
 core
-*.log

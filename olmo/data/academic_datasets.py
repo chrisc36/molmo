@@ -9,8 +9,6 @@ import datasets
 import numpy as np
 
 from olmo.data.dataset import DATA_HOME, DatasetBase, Dataset, HfDataset
-from olmo.data.pixmo_datasets import save_local_dataset
-from olmo.data.image_preprocessor import save_images
 from olmo.hf_datasets.a_okvqa import AOkVqaBuilder
 from olmo.hf_datasets.ai2d import Ai2dDatasetBuilder
 from olmo.hf_datasets.android_control import AndroidControlBuilder
@@ -25,12 +23,12 @@ from olmo.hf_datasets.vqa_v2 import VQAv2BuilderMultiQA
 
 if DATA_HOME is not None:
     DOWNLOADS = join(DATA_HOME, "downloads")
-    ACADEMIC_DATASETS = join(DATA_HOME, "academic_datasets")
-    ANDROID_IMAGES = join(DATA_HOME, "android_images")
+    INFOQA_SOURCE = join(DATA_HOME, "info_qa")
+    ST_QA_SRC = join(DATA_HOME, "scene-text")
 else:
     DOWNLOADS = None
-    ACADEMIC_DATASETS = None
-    ANDROID_IMAGES = None
+    INFOQA_SOURCE = None
+    ST_QA_SRC = None
 
 
 class ChartQa(HfDataset):
@@ -61,9 +59,9 @@ class ChartQa(HfDataset):
         super().__init__(split, keep_in_memory=keep_in_memory)
         if self.parts != "both":
             # Filter out either human or aug datasets
-            to_keep = 0 if (self.parts == "human") else 1
+            flags = [int(self.parts == "human")]
             self.dataset = self.dataset.filter(
-                lambda x: x == to_keep,
+                lambda x: x in flags,
                 input_columns=["human_or_machine"]
             )
 
@@ -75,7 +73,7 @@ class ChartQa(HfDataset):
             answers=ex["label"],
             style="chart_qa",
             metadata=dict(
-                is_human=ex['human_or_machine'] == 0,
+                is_human=ex['human_or_machine'],
             )
         )
         if self.weighted:
@@ -94,7 +92,7 @@ class Vqa2(Dataset):
     def download(cls, n_procs=1):
         VQAv2BuilderMultiQA(DOWNLOADS).download_and_prepare()
 
-    def __init__(self, split, multi_question=False, sample=None):
+    def __init__(self, split, multi_question=False):
         assert split in ["train", "validation", "test"]
         self.multi_question = multi_question
         self.dataset = VQAv2BuilderMultiQA(DOWNLOADS).as_dataset(split=split)
@@ -110,13 +108,7 @@ class Vqa2(Dataset):
                         image_id=item["image_id"],
                         question_id=q["question_id"],
                     ))
-            if sample:
-                logging.info(f"Sampling {sample} of {len(flattened_data)} ({100*sample/len(flattened_data)}:0.1f)")
-                np.random.RandomState(9123).shuffle(flattened_data)
-                flattened_data = flattened_data[:sample]
             self.dataset = flattened_data
-        else:
-            assert sample is None
 
     def __len__(self):
         return len(self.dataset)
@@ -205,17 +197,12 @@ class OkVqa(Dataset):
 
     @classmethod
     def download(cls, n_procs=1):
-        local_name = join(ACADEMIC_DATASETS, "okvqa")
         datasets.load_dataset_builder(cls.PATH, trust_remote_code=True).download_and_prepare()
-        ds = datasets.load_dataset(cls.PATH, trust_remote_code=True)
-        save_local_dataset(ds, local_name, n_procs)
 
     def __init__(self, split: str, multi_question=False, keep_in_memory=False):
         super().__init__()
         self.multi_question = multi_question
-        dataset = datasets.load_from_disk(
-            join(ACADEMIC_DATASETS, "okvqa"), keep_in_memory=keep_in_memory
-        )[split]
+        dataset = datasets.load_dataset(self.PATH, split=split, trust_remote_code=True, keep_in_memory=keep_in_memory)
         if self.multi_question:
             grouped_by_image = defaultdict(list)
             for ex in dataset:
@@ -320,18 +307,11 @@ class AI2D(Dataset):
 
     @classmethod
     def download(cls, n_procs=1):
-        local_name = join(ACADEMIC_DATASETS, "ai2d")
         Ai2dDatasetBuilder().download_and_prepare()
-        all_data = datasets.DatasetDict()
-        for split in ["train", "validation", "test"]:
-            ds = Ai2dDatasetBuilder().as_dataset(split)
-            all_data[split] = ds
-        save_local_dataset(all_data, local_name, n_procs)
 
-    def __init__(self, split, boxes="both", keep_in_memory=False):
+    def __init__(self, split, boxes="both"):
         assert split in ["train", "validation", "test"]
-        dataset = datasets.load_from_disk(
-            join(ACADEMIC_DATASETS, "ai2d"), keep_in_memory=keep_in_memory)[split]
+        dataset = Ai2dDatasetBuilder().as_dataset(split)
         if boxes == "transparent":
             dataset = dataset.filter(lambda x: not x["abc_label"] or x["has_transparent_box"])
         elif boxes == "opaque":
@@ -398,7 +378,7 @@ class ScienceQAImageOnly(Dataset):
         question =  ex["question"]
         hint = ex["hint"]
         if hint:
-            question = hint + "\n" + question
+            question = hint + "\n" + hint
         return dict(
             image=ex["image"],
             question=question,
@@ -406,6 +386,51 @@ class ScienceQAImageOnly(Dataset):
             answer_idx=ex["answer"],
             options=ex["choices"],
         )
+
+
+class InfoQa(DatasetBase):
+    SPLITS = ["train", "validation", "test"]
+
+    @classmethod
+    def download(cls, n_procs=1):
+        for split in cls.SPLITS:
+            if split == "validation":
+                filename = "infographicsVQA_val_v1.0_withQT.json"
+            else:
+                filename = f"infographicsVQA_{split}_v1.0.json"
+            if not exists(join(INFOQA_SOURCE, filename)):
+                raise ValueError(
+                    "InfoQa requires manually downloading https://rrc.cvc.uab.es/?ch=17 (Task 3)"
+                    f" please download and unzip the data into `{INFOQA_SOURCE}`"
+                )
+
+    def __init__(self, split):
+        assert split in self.SPLITS
+        super().__init__(split)
+
+    def load(self):
+        split = self.split
+        if split == "validation":
+            filename = "infographicsVQA_val_v1.0_withQT.json"
+        else:
+            filename = f"infographicsVQA_{split}_v1.0.json"
+        filename = join(INFOQA_SOURCE, filename)
+        logging.info(f"Loading docqa data from {filename}")
+        with open(filename) as f:
+            data = json.load(f)
+        out = []
+        for ex in data["data"]:
+            image_path = join(INFOQA_SOURCE, "images", ex.pop("image_local_name"))
+            out.append(dict(
+                image=image_path,
+                question=ex["question"],
+                answers=ex.get("answers", []),
+                metadata=dict(example_id=ex["questionId"]),
+            ))
+        return out
+
+    def get(self, item, rng):
+        return dict(**self.data[item], style="info_qa")
 
 
 class DocQa(HfDataset):
@@ -441,17 +466,60 @@ class DocQa(HfDataset):
             ), style="doc_qa")
 
 
+class SceneTextQa(DatasetBase):
+
+    @classmethod
+    def download(cls, n_procs=1):
+        for split in ["train", "test"]:
+            if not exists(join(join(ST_QA_SRC, f"{split}_task_3.json"))):
+                raise ValueError(
+                    "SceneTextQa requires manually downloading https://rrc.cvc.uab.es/?ch=11"
+                    f" please download and unzip the data into `{ST_QA_SRC}`"
+                )
+
+    def __init__(self, split):
+        assert split in ["train", "test", "validation"]
+        super().__init__(split)
+
+    def load(self):
+        split = self.split
+        if split == "validation":
+            split = "train"
+        src = join(ST_QA_SRC, f"{self.split}_task_3.json")
+        logging.info(f"Loading scene text data from {src}")
+        with open(src) as f:
+            data = json.load(f)["data"]
+        out = []
+        for question in data:
+            out.append(dict(
+                image=join(ST_QA_SRC, question["file_path"]),
+                question=question["question"],
+                metadata=dict(example_id=question["question_id"]),
+                answers=question.get("answers", []),
+            ))
+        if self.split in ["train", "validation"]:
+            # Custom val split since the data doesn't have one
+            out.sort(key=lambda x: x["metadata"]["example_id"])
+            np.random.RandomState(63069).shuffle(out)
+            if self.split == "train":
+                return out[1024:]
+            else:
+                return out[:1024]
+        else:
+            return out
+
+    def get(self, item, rng):
+        return dict(self.data[item], style="st_qa")
+
+
 class CountBenchQa(Dataset):
 
     @classmethod
     def download(self, n_procs=1):
-        local_name = join(ACADEMIC_DATASETS, "countbench_qa")
         CountQaBuilder().download_and_prepare()
-        ds = CountQaBuilder().as_dataset("test")
-        save_local_dataset(ds, local_name, n_procs)
 
     def __init__(self):
-        self.dataset = datasets.load_from_disk(join(ACADEMIC_DATASETS, "countbench_qa"))
+        self.dataset = CountQaBuilder().as_dataset("test")
 
     def __len__(self):
         return len(self.dataset)
@@ -474,18 +542,11 @@ class TabWMPDirectAnswer(Dataset):
 
     @classmethod
     def download(cls, n_procs=1):
-        local_name = join(ACADEMIC_DATASETS, "tabwmp")
         TabMwpBuilder().download_and_prepare()
-        all_data = datasets.DatasetDict()
-        for split in ["train", "dev", "test"]:
-            ds = TabMwpBuilder().as_dataset(split)
-            all_data[split] = ds
-        save_local_dataset(all_data, local_name, n_procs)
 
-    def __init__(self, split, include_options: bool, keep_in_memory=False):
+    def __init__(self, split, include_options: bool):
         self.include_options = include_options
-        self._dataset = datasets.load_from_disk(
-            join(ACADEMIC_DATASETS, "tabwmp"), keep_in_memory=keep_in_memory)[split]
+        self._dataset = TabMwpBuilder().as_dataset(split)
 
     def __len__(self):
         return len(self._dataset)
@@ -510,18 +571,11 @@ class FigureQa(Dataset):
 
     @classmethod
     def download(cls, n_procs=1):
-        local_name = join(ACADEMIC_DATASETS, "figure_qa")
         FigureQaBuilder().download_and_prepare()
-        all_data = datasets.DatasetDict()
-        for split in ["train", "validation1", "test1", "validation2", "test2"]:
-            ds = FigureQaBuilder().as_dataset(split)
-            all_data[split] = ds
-        save_local_dataset(all_data, local_name, n_procs)
 
     def __init__(self, split, in_memory=False):
         assert split in ["train", "validation1", "test1", "validation2", "test2"]
-        self.hf_dataset = datasets.load_from_disk(
-            join(ACADEMIC_DATASETS, "figure_qa"), keep_in_memory=in_memory)[split]
+        self.hf_dataset = FigureQaBuilder().as_dataset(split, in_memory=in_memory)
 
     def get(self, item, rng):
         example = self.hf_dataset[int(item)]
@@ -560,34 +614,12 @@ class PlotQa(Dataset):
 class AndroidControl(Dataset):
     @classmethod
     def download(cls, n_procs=1):
-        local_name = join(ACADEMIC_DATASETS, "android_control")
-        # AndroidControlBuilder().download_and_prepare(num_proc=n_procs)
-        all_data = datasets.DatasetDict()
-        for split in ["train", "val", "test"]:
-            ds = AndroidControlBuilder().as_dataset(split)
-            ds = ds.add_column("id", list(range(len(ds))))
-            pil_images = (ex["image"] for ex in ds)
-            filenames = [
-                join(ANDROID_IMAGES, f"{split}_{example_id:05d}.png")
-                for example_id in ds["id"]
-            ]
-            saved_images = save_images(pil_images, filenames, n_procs)
-            assert len(saved_images) == len(filenames)
-            def pil_to_path(ex):
-                ex["image"] = join(ANDROID_IMAGES, f"{split}_{ex['id']:05d}.png")
-                return ex
-            new_features = ds.features.copy()
-            new_features["image"] = datasets.Value(dtype="string")
-            ds = ds.map(pil_to_path, features=new_features)
-            ds = ds.remove_columns(["id"])
-            all_data[split] = ds
-        save_local_dataset(all_data, local_name, n_procs)
+        AndroidControlBuilder().download_and_prepare(num_proc=n_procs)
 
     def __init__(self, split, mode="all", in_memory=False):
         self.mode = mode
-        self.hf_dataset = datasets.load_from_disk(
-            join(ACADEMIC_DATASETS, "android_control"), keep_in_memory=in_memory
-        )["val" if split == "validation" else split]
+        self.hf_dataset = AndroidControlBuilder().as_dataset(
+            "val" if split == "validation" else split, in_memory=in_memory)
 
     def __len__(self):
         return len(self.hf_dataset)
@@ -643,17 +675,10 @@ class AndroidControl(Dataset):
 class DvQa(Dataset):
     @classmethod
     def download(cls, n_procs=1):
-        local_name = join(ACADEMIC_DATASETS, "dv_qa")
         DvQaBuilder().download_and_prepare()
-        all_data = datasets.DatasetDict()
-        for split in ["train", "val_hard", "val_easy"]:
-            ds = DvQaBuilder().as_dataset(split)
-            all_data[split] = ds
-        save_local_dataset(all_data, local_name, n_procs)
 
     def __init__(self, split, in_memory=False):
-        self.hf_dataset = datasets.load_from_disk(
-            join(ACADEMIC_DATASETS, "dv_qa"), keep_in_memory=in_memory)[split]
+        self.hf_dataset = DvQaBuilder().as_dataset(split, in_memory=in_memory)
 
     def __len__(self):
         return len(self.hf_dataset)
@@ -792,18 +817,11 @@ class ClockBench(Dataset):
 
     @classmethod
     def download(cls, n_procs=1):
-        local_name = join(ACADEMIC_DATASETS, "clock_bench")
         ClockBenchBuilder().download_and_prepare()
-        all_data = datasets.DatasetDict()
-        for split in ["coco", "openimg", "movies"]:
-            ds = ClockBenchBuilder().as_dataset(split)
-            all_data[split] = ds
-        save_local_dataset(all_data, local_name, n_procs)
 
-    def __init__(self, split, keep_in_memory=False):
+    def __init__(self, split):
         assert split in ["coco", "openimg", "movies"]
-        dataset = datasets.load_from_disk(
-            join(ACADEMIC_DATASETS, "clock_bench"), keep_in_memory=keep_in_memory)[split]
+        dataset = ClockBenchBuilder().as_dataset(split)
         self.dataset = dataset
         self.split = split
 

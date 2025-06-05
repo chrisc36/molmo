@@ -103,11 +103,7 @@ if __name__ == "__main__":
             persistent_workers=True,
         ),
     )
-
-    if args.two_epochs:
-        duration_factor = 2
-    else:
-        duration_factor = 1
+    duration_factor = 4
 
     cfg = TrainConfig(
         save_folder="debug_run" if debug else omegaconf.MISSING,

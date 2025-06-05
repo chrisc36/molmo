@@ -240,10 +240,6 @@ GENERAL_PROMPTS_V1 = {
 }
 
 
-GENERAL_PROMPTS_V1["video_short_caption"] = [prompt.replace("image", "video").replace("picture", "video") for prompt in GENERAL_PROMPTS_V1["short_caption"]]
-GENERAL_PROMPTS_V1["video_long_caption"] = [prompt.replace("image", "video").replace("picture", "video") for prompt in GENERAL_PROMPTS_V1["long_caption"]]
-
-
 STYLE_TO_GENERAL_PROMPT = {
     "vqa2": "short_answer",
     "coco_captioning": "short_caption",
@@ -303,8 +299,6 @@ DEMO_STYLES = [
     "user_qa",
     "long_caption",
     "short_caption",
-    "video_long_caption",
-    "video_short_caption"
 ]
 
 
@@ -319,8 +313,6 @@ class DataFormatter(BaseConfig):
     select_answer: str = "best"  # How to select answer for questions with many answers
     debug: bool = False  # deterministic mode for debugging
     image_last: bool = False
-    format_message_list: Optional[str] = None
-    p_one_message: float = 0
 
     def points_to_text(self, points, scale, label_text, alt_text):
         if isinstance(scale, (tuple, list)):
@@ -367,10 +359,7 @@ class DataFormatter(BaseConfig):
             point_txt = self.points_to_text(points, example["point_scale"], label, label)
         else:
             # Points are in pixel coordinate
-            try:
-                h, w = example["image"].shape[:2]
-            except Exception as e:
-                w, h = example["image"].size
+            h, w = example["image"].shape[:2]
             point_txt = self.points_to_text(points, [w/100, h/100], label, label)
 
         if style == "point_count":
@@ -432,11 +421,7 @@ class DataFormatter(BaseConfig):
             style = "vqa2"
         elif style == "eval_multiple_choice":
             style = "a_okvqa_mc"
-        elif style == "video_eval_short_answer":
-            style = "llava_video_da"
-        elif style == "video_eval_multiple_choice":
-            style = "llava_video_mc"
-        
+
         if self.system_prompt == "style":
             return style + ":"
 
@@ -523,7 +508,7 @@ class DataFormatter(BaseConfig):
             else:
                 # We template long captions and pointing since they are "demo" tasks, and use
                 # plain text for everything else
-                if style in ["long_caption", "short_caption", "video_long_caption", "video_short_caption"] and "question" not in example:
+                if style in ["long_caption", "short_caption"] and "question" not in example:
                     prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1[style], example, rng, dbg=self.debug)
                 elif "_exp" in style:
                     prompt = apply_keyword_prompt(GENERAL_PROMPTS_V1["chain_of_thought"], example, rng, dbg=self.debug)
@@ -576,7 +561,7 @@ class DataFormatter(BaseConfig):
         for k in ["answer_idx", "answers", "answer", "points", "options"]:
             if k in message:
                 metadata[k] = message[k]
-        
+
         if isinstance(message, str):
             messages = [message]
         elif isinstance(message, list):
@@ -613,7 +598,7 @@ class DataFormatter(BaseConfig):
 
         if (
             self.image_last and
-            ("image" in example or "video" in example) and
+            "image" in example and
             tokenizer.IMAGE_PROMPT not in messages[0]
         ):
             messages[0] = messages[0] + tokenizer.IMAGE_PROMPT
@@ -624,17 +609,6 @@ class DataFormatter(BaseConfig):
 
     def __call__(self, ex: Dict, is_training, for_inference, rng) -> Tuple[Dict, Dict]:
         """Returns a formatted example and example metadata"""
-
-        if "message_list" in ex:
-            if self.p_one_message and rng.random() < self.p_one_message:
-                ex["message_list"] = ex["message_list"][:1]
-            elif self.format_message_list == "numbered_qa":
-                ex["message_list"] = [dict(x) for x in ex["message_list"]]
-                for ix, msg_list in enumerate(ex["message_list"], start=1):
-                    msg_list["question"] = f"{' ' if ix != 0 else ''}Q{ix}: {msg_list['question']}"
-                    msg_list["answer"] = f"A{ix}: " + msg_list["answer"]
-            else:
-                assert self.format_message_list is None
 
         if "message_list" in ex:
             # Does not support returning metadata, which is fine since we are not doing inference

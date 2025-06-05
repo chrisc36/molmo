@@ -231,7 +231,6 @@ class Trainer:
     min_train_loss: float = float("inf")
     cur_train_loss: float = float("inf")
     loss_fn: Callable[..., torch.Tensor] = field(default_factory=lambda: cross_entropy_loss)  # type: ignore
-    beaker_logger: BeakerLogger = None
     last_sharded_checkpoint_step: Optional[int] = None
     last_unsharded_checkpoint_step: Optional[int] = None
     _train_metrics: Any = None
@@ -990,17 +989,6 @@ class Trainer:
                         metrics.update(batch_monitor.check(self.device))
                         metrics.update(lr_monitor.check())
 
-                    # Do beaker logging
-                    if (
-                        self.beaker_logger and
-                        (
-                            (self.global_step % self.beaker_logger.log_interval == 0) or
-                            # Log on step 0 so we can tell the model is done initializing
-                            (self.beaker_logger.log_interval == 0 and self.global_step == 1)
-                        )
-                    ):
-                        self.beaker_logger.log_progress(self.global_step, self.cfg.stop_at)
-
                     # Log metrics to console.
                     if self.global_step % self.cfg.console_log_interval == 0:
                         if get_global_rank() == 0:
@@ -1149,8 +1137,6 @@ class Trainer:
             gc.disable()
         if wandb.run is not None:
             wandb.finish(exit_code=exit_code, quiet=True)
-        if self.beaker_logger is not None:
-            self.beaker_logger.close()
 
     def __enter__(self) -> Trainer:
         return self

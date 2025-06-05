@@ -3,6 +3,7 @@ import dataclasses
 import json
 import logging
 import os
+import pickle
 import re
 import sys
 from datetime import datetime
@@ -12,6 +13,7 @@ from typing import Optional, List, Tuple
 import omegaconf
 import torch
 import wandb
+from torch import distributed as dist
 
 from olmo.config import BaseConfig
 from olmo.data.data_loader import DataLoaderConfig
@@ -483,13 +485,13 @@ class ModelEvaluator:
 
             metrics_file = self.get_metric_file(evaluation)
             if metrics_file and file_exists(metrics_file):
-                # assert not self.config.skip_if_metrics_cached
+                assert not self.config.skip_if_metrics_cached
                 logging.warning(f"{metrics_file} already exists! File will be overwritten")
 
             save_dir = self.get_save_dir(evaluation)
             if evaluation.generative:
                 evaluator: InfDatasetEvaluator = evaluation.build_evaluator(
-                    model.config, device, save_dir, self.config.console_log_interval)
+                    model.config, device, save_dir, self.config.console_log_interval, self.config.include_image)
                 metrics = evaluator.run(
                     model, device,
                     autocast_precision=self.config.autocast_precision,
@@ -638,35 +640,6 @@ class ModelEvaluator:
             to_print = {k: v for k, v in all_metrics.items() if isinstance(v, (int, float, str))}
             log_metrics_to_console("all-metrics", to_print)
         return all_metrics
-
-    def get_expert_stats(self):
-        config = self.config
-        assert len(config.evaluations) > 0
-
-        model, processor, device = self.initialize_and_load_hf_model()
-
-        all_stats = {}
-        for eval_ix, evaluation in enumerate(config.evaluations):
-            if not evaluation.generative:
-                continue
-
-            if len(config.evaluations) == 1:
-                logging.info(f"Starting inference {evaluation.label}")
-            else:
-                logging.info(f"Starting inference {evaluation.label} ({eval_ix+1}/{len(config.evaluations)})")
-
-            evaluator: InfDatasetEvaluator = evaluation.build_hf_evaluator(
-               processor, model.config, device, None, self.config.console_log_interval)
-            expert_scores = evaluator.get_expert_stats(
-                model, processor, device,
-                autocast_precision=self.config.autocast_precision,
-                is_distributed=self.config.fsdp is not None,
-                pbar=self.config.pbar,
-            )
-
-            all_stats[evaluation.label] = expert_scores
-
-        return all_stats
 
 
 if __name__ == "__main__":

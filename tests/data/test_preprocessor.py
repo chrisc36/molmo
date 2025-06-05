@@ -3,7 +3,6 @@ from olmo import tokenizer
 import re
 
 from olmo.data.interleaved_text_preprocessor import InterleavedTextPreprocessor
-from olmo.models.video_olmo.video_preprocessor import VIDEO_SUBSEGMENT_ID
 from olmo.tokenizer import build_tokenizer, IMAGE_PROMPT
 from tests.models.test_video_preprocessor import _remove_video_text
 

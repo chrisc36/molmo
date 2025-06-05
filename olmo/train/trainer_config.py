@@ -23,11 +23,9 @@ from olmo.data.data_loader import DataLoaderConfig
 from olmo.eval.inf_evaluator import InfDatasetEvaluatorConfig
 from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.exceptions import OLMoConfigurationError
-from olmo.models.he_molmo.he_molmo import HeMolmo
 from olmo.io import PathOrStr, read_file
 from olmo.models.model_config import BaseModelConfig, get_model_types
 from olmo.train.checkpointer import CheckpointerConfig
-from olmo.models.molmo.molmo import Molmo
 from olmo.models.model import FSDPWrapStrategy
 from olmo.torch_util import get_local_world_size, get_world_size
 from olmo.train.optim import OptimizerConfig, SchedulerConfig
@@ -208,7 +206,6 @@ class FSDPConfig(BaseConfig):
 class BatchDivisor(StrEnum):
     global_batch = "global_batch"
     device_batch = "device_batch"
-    instance = "instance"
 
 
 @dataclass
@@ -218,8 +215,6 @@ class RuntimeData(BaseConfig):
     date: str
     world_size: int
     resuming_from: Optional[str]
-    beaker_experiment_id: Optional[str]
-    beaker_experiment_url: Optional[str]
     wandb_id: Optional[str]
     wandb_url: Optional[str]
 

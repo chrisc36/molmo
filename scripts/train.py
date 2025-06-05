@@ -11,7 +11,6 @@ from pathlib import Path
 
 import torch
 import wandb
-from beaker import Beaker
 from omegaconf import OmegaConf
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -27,7 +26,8 @@ from olmo.torch_util import (
     seed_all,
     freeze_module,
 )
-from olmo.train.trainer import Trainer, BeakerLogger
+from olmo.train.remote_filesystem import RemoteFileSystemReader
+from olmo.train.trainer import Trainer
 from olmo.train.trainer_config import TrainConfig, RuntimeData
 from olmo.util import (
     clean_opt,
@@ -67,7 +67,7 @@ def run_trainer(cfg: TrainConfig) -> None:
         if lastest_checkpoint:
             log.info(f"Resuming from {lastest_checkpoint}")
             if get_global_rank() == 0:
-                saved_config = TrainConfig.load(join(cfg.save_folder, "config.yaml"))
+                saved_config: TrainConfig = TrainConfig.load(join(cfg.save_folder, "config.yaml"))
                 if saved_config.model != cfg.model:
                     log.warning("Model config does not match the one resuming from")
                 if saved_config.optimizer != cfg.optimizer:
@@ -209,22 +209,6 @@ def run_trainer(cfg: TrainConfig) -> None:
     else:
         inf_evaluators = None
 
-    # Maybe build the BeakerLogger
-    if "BEAKER_EXPERIMENT_ID" in os.environ and "BEAKER_TOKEN" in os.environ:
-        if get_global_rank() == 0:
-            experiment_id = os.environ["BEAKER_EXPERIMENT_ID"]
-            client = Beaker.from_env()
-            experiment = client.experiment.get(experiment_id)
-            beaker_logger = BeakerLogger(client, experiment, cfg.beaker_log_interval, experiment.description)
-            beaker_logger.log_init()
-        else:
-            beaker_logger = None
-    else:
-        if cfg.beaker_log_interval > 0 and "BEAKER_EXPERIMENT_ID" in os.environ:
-            logging.info(f"Beaker log interval set to {cfg.beaker_log_interval}, but beaker "
-                         f"token is missing, so beaker logging will turned off")
-        beaker_logger = None
-
     # Maybe start W&B run.
     if cfg.wandb is not None and (get_global_rank() == 0 or not cfg.wandb.rank_zero_only):
         wandb_dir = Path(cfg.save_folder) / "wandb"
@@ -233,10 +217,21 @@ def run_trainer(cfg: TrainConfig) -> None:
 
         if "BEAKER_EXPERIMENT_ID" in os.environ:
             wandb_cfg["beaker_experiment_id"] = os.environ["BEAKER_EXPERIMENT_ID"]
-            if beaker_logger is not None:
-                wandb_cfg["beaker_url"] = beaker_logger.beaker.experiment.url(beaker_logger.experiment)
         if is_resuming:
             wandb_cfg["resuming_from"] = start_from
+        if is_resuming and cfg.wandb.allow_resume:
+            resume_run_id = saved_config.runtime_data.wandb_id
+            resume_step = int(re.match(r".*step([0-9]+).*", lastest_checkpoint).group(1))
+            resume_from = f"{resume_run_id}?_step={resume_step}"
+            run_id = resume_run_id
+            run = wandb.Api().run(f"/{cfg.wandb.entity}/{cfg.wandb.project}/{run_id}")
+            if run.state == "running":
+                log.warning(f"Wandb run {run_id} is still marked as running, waiting for it to finish")
+                run.wait_until_finished()
+        else:
+            run_id = None
+            resume_from = None
+
         wandb.init(
             dir=str(wandb_dir),
             project=cfg.wandb.project,
@@ -245,19 +240,16 @@ def run_trainer(cfg: TrainConfig) -> None:
             name=cfg.wandb.name,
             tags=cfg.wandb.tags,
             config=wandb_cfg,
+            id=run_id,
+            resume_from=resume_from
         )
         wandb_url = wandb.run.get_url()
-        if beaker_logger is not None:
-            beaker_logger.add_wandb(wandb_url)  # add wandb url to beaker description
 
     # Fill in some runtime data so it will be recorded when we save the config
     cfg.runtime_data = RuntimeData(
         hostname=socket.gethostname(),
         date=datetime.now().strftime("%m/%d/%Y, %H:%M"),
         world_size=get_world_size(),
-        beaker_experiment_id=os.environ.get("BEAKER_EXPERIMENT_ID"),
-        beaker_experiment_url=(None if beaker_logger is None else
-                               beaker_logger.beaker.experiment.url(beaker_logger.experiment)),
         wandb_url=wandb.run.get_url() if wandb.run else None,
         wandb_id=wandb.run.id if wandb.run else None,
         args=" ".join(sys.argv),
@@ -284,7 +276,6 @@ def run_trainer(cfg: TrainConfig) -> None:
         device=device,
         evaluators=evaluators,
         inference_evaluators=inf_evaluators,
-        beaker_logger=beaker_logger,
     ) as trainer:
 
         if start_from:

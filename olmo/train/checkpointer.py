@@ -90,22 +90,6 @@ def load_model_state(dir: PathOrStr, model: nn.Module, cfg: CheckpointerConfig =
     Works for any combination of sharded/unshared checkpoints and sharded/unshared model
     """
     t0 = time.perf_counter()
-    # # if get_global_rank() == 0:
-    # # state_dict = torch.load(resource_path(dir, MODEL_FILENAME),
-    # #                         map_location="cpu", weights_only=True)
-    # # model = torch.compile(model)
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # # Load state dict on CPU first
-    # state_dict = torch.load(resource_path(dir, MODEL_FILENAME), map_location="cpu")
-    # # Move model to GPU before loading weights
-    # model.to(device).half()
-
-    # # Load each parameter safely
-    # for name, param in state_dict.items():
-    #     if name in model.state_dict():
-    #         model.state_dict()[name].copy_(param.to(device), non_blocking=True)
-
     if is_unsharded_checkoint(dir):
         log.info(f"Loading model state from unsharded checkpoint {dir}...")
         load_model_state_unsharded(dir, model)
