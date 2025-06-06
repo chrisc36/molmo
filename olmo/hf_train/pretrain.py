@@ -24,6 +24,7 @@ import torch
 import transformers
 import tokenizers
 
+from olmo.hf_train.collator import HF_MMCollator
 from olmo.hf_train.molmo_trainer import MolmoTrainer
 
 from olmo.hf_models import *
@@ -36,7 +37,6 @@ from olmo.torch_util import get_world_size
 from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.nn.vision_backbone import ImagePaddingEmbed
 from olmo.train.optim import OptimizerConfig, OptimizerType, SchedulerConfig, SchedulerType
-from olmo.models.molmo.collator import HF_MMCollator
 from transformers import set_seed
 
 set_seed(42)
