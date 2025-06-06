@@ -24,53 +24,53 @@
 
 Molmo is a repository for training and using Ai2's state-of-the-art multimodal open language models.
 
-Here is a **[video demo](https://www.youtube.com/watch?v=spBxYa3eAlA)** of Molmo's capabilities. Try Molmo using our public **[demo](https://molmo.allenai.org)** showcasing the Molmo-7B-D model.
 
-This codebase is based on the [OLMo codebase](https://github.com/allenai/OLMo) with the addition
-of vision encoding and integrating generative evaluations.
+## NEW: Training `transformers.AutoModelForCausalLM` compatible models
 
-This is a development branch containing improved code and support for the HF trainer.
+- We add the support to train Molmo models with decoder LLMs: OLMoE/OLMo/OLMo-2/Qwen2 using the hf `transformers.Trainer` with the help of deepspeed ZeRO-Stage-2 and accelerate.
 
-## Release Notes
-- 
-- [2025/06/04] **Molmo**: updated and improved code for Molmo, include:
-  - Support for SiglIP 2, Qwen2.5, and OLMo 2.
-  - Ability to train with the HuggingfaceTrainer
-  - Evaluating HF models directly without converting them to our model format
-  - Improved code, including refactored configuration setup and simplified pre-preprocessing.
-  
-- [2024/12/05] **🔥 Molmo**: code for modeling, training and evaluation has been released. You can find detailed technical report [here](https://arxiv.org/pdf/2409.17146).
+- To setup, please follow the instructions below:
+  ```bash
+  conda create --name molmo -y python==3.11
+  pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+  pip install -e .["all"]
+  pip install flash-attn==2.7.2.post1 --no-build-isolation
+  pip install transformers==4.43.1
+  pip install deepspeed==0.14.5
 
-- [2024/11/27] **🔥 [PixMo](https://huggingface.co/collections/allenai/pixmo-674746ea613028006285687b)**, our new collection of datasets for pre-training and fine-tuning VLMs, has been released. PixMo consists of:
+  ## set the env variable for the dataset path (if you are using the AI2 weka data storage)
+  export MOLMO_DATA_DIR=/root/home/datasets/mm-olmo
+  export HF_HOME=/root/home/datasets/mm-olmo/hf_datasets
+  ```
 
-  - [**PixMo-Cap**](https://huggingface.co/datasets/allenai/pixmo-cap) (pre-training, fine-tuning): highly detailed dense caption dataset (roughly 200 words on average)
-  - [**PixMo-AskModelAnything**](https://huggingface.co/datasets/allenai/pixmo-ask-model-anything) (fine-tuning): instruction-tuning data containing human-authored image-question-answer triplets
-  - [**PixMo-CapQA**](https://huggingface.co/datasets/allenai/pixmo-cap-qa) (fine-tuning): synthetic instruction-tuning data, using a LLM to build QA pairs from dense captions of images
-  - [**PixMo-Points**](https://huggingface.co/datasets/allenai/pixmo-points) (fine-tuning): images paired with referring expressions and annotated points, supporting grounding and counting
-  - [**PixMo-Point-Explanations**](https://huggingface.co/datasets/allenai/pixmo-point-explanations) (fine-tuning): instruction-tuning data with explanations containing in-line points referring to parts of the image
-  - [**PixMo-Docs**](https://huggingface.co/datasets/allenai/pixmo-docs) (fine-tuning): synthetic image-question-answer triplets about various kinds of computer-generated charts, tables, diagrams and documents. Code available [here](https://github.com/allenai/pixmo-docs).
-  - [**PixMo-Clocks**](https://huggingface.co/datasets/allenai/pixmo-clocks) (fine-tuning): virtual watch faces and time annotations
-  - [**PixMo-Count**](https://huggingface.co/datasets/allenai/pixmo-count) (fine-tuning): diverse images with counting QA pairs
+### Train
 
-  All datasets were constructed **without the use of VLMs**.
+- Captioner train
 
-<div align="center">
-  <img src="assets/png_version_molmo_pixmo.png" alt="Pixmo and Molmo" width="800" style="margin-left:'auto' margin-right:'auto' display:'block'"/>
-  <br>
-  <p>Datasets in PixMo (left) and the capabilities they enable in Molmo (right).
-  <br>
-</div>
+  ```bash
+  bash scripts/hf/captioner.sh
+  ```
 
-- [2024/09/24] **🔥 [Molmo](https://huggingface.co/collections/allenai/molmo-66f379e6fe3b8ef090a8ca19)**, a new family of open VLMs, has been released. The Molmo family consists of:
+- Multi-task train
 
-  - [**MolmoE-1B**](https://huggingface.co/allenai/MolmoE-1B-0924): a mixture of experts model with 1B (active) 7B (total)
-  - [**Molmo-7B-O**](https://huggingface.co/allenai/Molmo-7B-O-0924): our most open 7B model
-  - [**Molmo-7B-D**](https://huggingface.co/allenai/Molmo-7B-D-0924): our best 7B and demo model
-  - [**Molmo-72B**](https://huggingface.co/allenai/Molmo-7B-D-0924): our best 72B model
+  ```bash
+  bash scripts/hf/multi_task.sh
+  ```
 
+### Eval
+
+- Captioner eval
+  ```bash
+  bash scripts/hf/eval_captioner.sh
+  ```
+- VQA eval
+  ```bash
+  bash scripts/hf/eval_vqa.sh
+  ```
+
+>Note: This code is built on top of the original molmo codebase. Please read the instructions below for more details.
 
 ## Installation
-
 We recommend using python 3.10.
 First install [PyTorch](https://pytorch.org) according to the instructions specific to your operating system.
 
@@ -242,6 +242,12 @@ and might need to set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 These scripts will save the metrics and predictions in the save directory. Future calls to the 
 eval script will re-use cached metrics if they exist, to overwrite these cached metrics use
 the `--overwrite` flag.
+
+### Evaluation Molmo models hosted on HF
+
+```bash
+torchrun --nproc-per-node 8 -m launch_scripts.eval_downstream Molmo-7B-D-0924 high-res --save_to_checkpoint_dir --high_res --is_hf_model # HF models can only use a batch size of 1 per GPU
+```
 
 ### Evaluation with VLMEvalkit
 Evaluation of the HF models is also supported via [open-compass/VLMEvalkit](https://github.com/open-compass/VLMEvalKit). Check [PR#648](https://github.com/open-compass/VLMEvalKit/pull/648) for supported prompts and evaluation settings to reproduce results from the paper.

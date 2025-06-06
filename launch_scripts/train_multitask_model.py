@@ -4,28 +4,25 @@ from os.path import join, exists
 from typing import cast, List
 
 import omegaconf
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 
 from launch_scripts.utils import get_evaluation, DEBUG_MODEL
-from olmo import TrainConfig
-from olmo.config import DataConfig, \
-    ModelConfig, WandbConfig, OptimizerConfig, OptimizerType, SchedulerConfig, SchedulerType, \
-    BatchDivisor, SpeedMonitorConfig, ActivationCheckpointingStrategy, FSDPConfig, FSDPWrapStrategy, \
-    FSDPPrecision, RootSizeMixture
-from olmo.torch_util import get_world_size
-from olmo.util import (
-    add_cached_path_clients,
-    clean_opt,
-    prepare_cli_environment,
+from olmo.train.optim import OptimizerType, OptimizerConfig, SchedulerConfig, SchedulerType
+from olmo.train.trainer_config import (
+    WandbConfig, BatchDivisor, SpeedMonitorConfig,
+    FSDPConfig, FSDPPrecision, CompilerConfig, TrainConfig
 )
-from scripts.train import main as train
+from olmo.models.model import FSDPWrapStrategy
+from olmo.models.molmo.molmo import MolmoConfig
+from olmo.data.data_loader import DataLoaderConfig, RootSizeMixture
+from olmo.torch_util import get_world_size
+from olmo.util import clean_opt, prepare_torchrun_environment, select_checkpoint
+from scripts.train import run_trainer
 
 log = logging.getLogger("train")
 
 
-AUX = [
+AUX_EXCEPT_DOCS = [
     # Supervised datasets we want eval on
     "coco_2014_vqa_multi",
     "text_vqa",
@@ -44,16 +41,34 @@ AUX = [
     "st_qa",
     "tally_qa",
 
-    # ("clocks", 250000),  # Downsample since it is huge
-    "pixmo_docs_charts",
-    "pixmo_docs_tables",
-    "pixmo_docs_other",
-    "pixmo_docs_diagrams",
+    ("pixmo_clocks", 250000),  # Downsample since it is huge
 
     # # Other synthetic data, also downsampled since they are huge
     ("dv_qa", 10000),
     ("figure_qa", 10000),
     ("plot_qa", 20000),
+]
+
+
+AUX = AUX_EXCEPT_DOCS + [
+    "pixmo_docs_charts",
+    "pixmo_docs_tables",
+    "pixmo_docs_other",
+    "pixmo_docs_diagrams",
+]
+
+
+AUX_COSYN_V1 = AUX_EXCEPT_DOCS + [
+    "cosyn_chart_exp",
+    "cosyn_chemical_exp",
+    # "cosyn_circuit_exp", # quality not good
+    "cosyn_diagram_exp",
+    "cosyn_document",
+    # "cosyn_graphic_exp", # quality not good
+    "cosyn_math_exp",
+    "cosyn_music_exp",
+    # "cosyn_nutrition_exp", # zero-shot evaluation dataset
+    "cosyn_table_exp",
 ]
 
 
@@ -70,20 +85,7 @@ def get_training_mixture(submixture):
 
 
 if __name__ == "__main__":
-    try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError as e:
-        print(f"failed to set multiprocessing start method: {e}")
-    log.info(f"Multiprocessing start method set to '{mp.get_start_method()}'")
-
-    # Initialize process group.
-    dist.init_process_group(backend="nccl")
-    log.info("Process group initialized")
-
-    prepare_cli_environment()
-    log.info("CLI environment prepared")
-
-    add_cached_path_clients()
+    prepare_torchrun_environment()
 
     parser = argparse.ArgumentParser(prog="Train a multitask model")
     parser.add_argument("mixture", help="Name of datset mixture to train on")
@@ -95,6 +97,8 @@ if __name__ == "__main__":
     parser.add_argument("--device_eval_batch_size", default=4, type=int)
     parser.add_argument("--device_inf_batch_size", default=4, type=int)
     parser.add_argument("--device_train_batch_size", default=4, type=int)
+    parser.add_argument("--include_image", action="store_true",
+                        help="Include image in the evaluation outputs")
     args, other_args = parser.parse_known_args()
 
     if args.mixture.startswith("single"):
@@ -107,6 +111,17 @@ if __name__ == "__main__":
     elif args.mixture in ["small1", "debug"]:
         eval_tasks = ["chart_qa", "doc_qa"]
         tasks = [["aux", ["chart_qa", "doc_qa"], 1.0]]
+    elif args.mixture in ["pointing"]:
+        eval_tasks = ["pointing_eval:test"]
+        tasks = [["pointing", [
+            "pixmo_points",
+            "pixmo_count",
+            "pixmo_points_high_freq",
+            "pixmo_points_counting",
+            "pixmo_points_high_freq_counting",
+            "pixmo_count_counting",
+        ], 1.0]]
+
     elif args.mixture == "small2":
         eval_tasks = ["chart_qa", "doc_qa", "info_qa"]
         tasks = [["aux", [("chart_qa", 4*4),
@@ -119,21 +134,48 @@ if __name__ == "__main__":
             "doc_qa",
             "ai2_diagram_v2_mix_transparent",
             "coco_2014_vqa_multi",
-            # "clocks",
+            "pixmo_clocks",
             "android_control_ll",
             "pointing_eval:test",
-            "countbench_qa:huggingface"
         ]
         tasks = [
             ["demo", [
                 "pixmo_ask_model_anything",
                 ("pixmo_cap", 50000),
-                "pixmo_cap_qa",
+                "pixmo_cap_qa_as_user_qa",
+                "pixmo_pointing_explanations"
+            ], 0.15],
+            ["aux", aux, 0.50],
+            ["pointing", [
+                "pixmo_points_train",
+                "pixmo_count_train",
+                "pixmo_points_high_freq_train",
+            ], 0.35]
+        ]
+    elif args.mixture in ["3.3-synthetic"]:
+        aux = list(AUX_COSYN_V1)
+        eval_tasks = [
+            "chart_qa",
+            "chart_qa_exp",
+            "info_qa",
+            "doc_qa",
+            "ai2_diagram_v2_mix_transparent",
+            "coco_2014_vqa_multi",
+            "pixmo_clocks",
+            "android_control_ll",
+            "pointing_eval:test",
+        ]
+        tasks = [
+            ["demo", [
+                "pixmo_ask_model_anything",
+                ("pixmo_cap", 50000),
+                "pixmo_cap_qa_as_user_qa",
                 "pixmo_pointing_explanations"
             ], 0.15],
             ["aux", aux, 0.50],
             ["pointing", [
                 "pixmo_points",
+                "cosyn_point",
                 "pixmo_count",
                 "pixmo_points_high_freq",
                 "pixmo_points_counting",
@@ -146,6 +188,7 @@ if __name__ == "__main__":
 
     debug = args.checkpoint in ["debug", "debug2"]
     if debug:
+        checkpoint = None
         model_cfg = DEBUG_MODEL
         if args.checkpoint == "debug2":
             model_cfg.max_crops = 12
@@ -171,44 +214,45 @@ if __name__ == "__main__":
         inf_eval_interval = 2000
         eval_interval = 2000
         duration = 30000
-        model_init = args.checkpoint
-        if exists(join(args.checkpoint, "model.yaml")):
-            model_cfg = ModelConfig.load(join(args.checkpoint, "model.yaml"))
+        checkpoint = select_checkpoint(args.checkpoint)
+        if exists(join(checkpoint, "model.yaml")):
+            model_cfg = MolmoConfig.load(join(checkpoint, "model.yaml"))
         else:
-            model_cfg = ModelConfig.load(join(args.checkpoint, "config.yaml"), key="model")
+            model_cfg = MolmoConfig.load(join(checkpoint, "config.yaml"), key="model")
 
         eval_subset_batches = eval_examples//(args.device_eval_batch_size*get_world_size())
         logging.info(f"Setting eval subset batches to {eval_subset_batches}")
         assert eval_subset_batches > 0
 
     # Fine-tuning settings
-    model_cfg.residual_dropout = 0.1
-    model_cfg.response_residual_dropout = 0.0
-    model_cfg.prompt_type = "uber_model"
-    model_cfg.message_formatting = "role"
-    model_cfg.system_prompt_kind = "demo_or_style"
-    model_cfg.multi_annotation_weighting = "root_subsegments"
+    model_cfg.llm.residual_dropout = 0.1
+    model_cfg.llm.response_residual_dropout = 0.0
+    model_cfg.data_formatter.prompt_templates = "uber_model"
+    model_cfg.data_formatter.message_format = "role"
+    model_cfg.data_formatter.system_prompt = "demo_or_style"
+    model_cfg.mm_preprocessor.loss_token_weighting = "root_subsegments"
 
     root_size_mixture: List[RootSizeMixture] = []
     for name, submixture, rate in tasks:
         submixture = get_training_mixture(submixture)
         root_size_mixture.append(RootSizeMixture(rate, submixture))
 
+    num_workers = 2
     evaluations = []
     for task in eval_tasks:
         evaluation = get_evaluation(
             task,
             args.inf_seq_len,
-            batch_size=get_world_size()*args.device_inf_batch_size,
+            device_batch_size=args.device_inf_batch_size,
             max_examples=max_inf_examples,
-            num_workers=2
+            num_workers=num_workers,
+            include_image=args.include_image,
         )
         evaluation.data.persistent_workers = True
         evaluations.append(evaluation)
 
     cfg = TrainConfig(
         run_name="multitask_train",
-        no_pre_train_checkpoint=True,
         save_folder="debug_run" if debug else omegaconf.MISSING,
         seed=6198,
         dry_run=False,
@@ -219,22 +263,21 @@ if __name__ == "__main__":
             entity="${oc.env:WANDB_ENTITY}",
             log_interval=log_interval
         ),
+        compile=CompilerConfig(mode="default", dynamic=False),
+        fused_loss=False,
         allow_resume=True,
         model=model_cfg,
         save_overwrite=debug,
-        save_dataloader_state=False,
-        data=DataConfig(
+        data=DataLoaderConfig(
             root_size_mixture=root_size_mixture,
-            for_inference=False,
             shuffle=True,
             split="train",
             drop_last=True,
             sequence_length=args.seq_len,
-            num_workers=2,
+            num_workers=num_workers,
             pad="to_max",
-            shuffle_messages=True,
             pin_memory=True,
-            seed=50189
+            seed=50189,
         ),
         ft_connector=True,
         ft_llm=True,
@@ -253,7 +296,6 @@ if __name__ == "__main__":
             connector_eps=1e-6,
             vit_eps=1e-6,
             llm_eps=1e-6,
-            metrics_log_interval=20
         ),
         scheduler=SchedulerConfig(
             name=SchedulerType.multimodal,
@@ -269,13 +311,10 @@ if __name__ == "__main__":
             precision=FSDPPrecision.float
         ),
         load_path=None,
-        initial_model_checkpoint=None if "debug" in args.checkpoint else args.checkpoint,
-        save_interval=4000,
+        initial_model_checkpoint=checkpoint,
+        save_interval=2000,
         save_num_checkpoints_to_keep=1,
-        save_interval_unsharded="${max_duration}",
         global_train_batch_size=global_batch_size,
-        device_inf_eval_batch_size=args.device_inf_batch_size,
-        device_eval_batch_size=args.device_eval_batch_size,
         device_train_microbatch_size=args.device_train_batch_size,
         time_limit=None,
         max_duration=duration,
@@ -284,20 +323,18 @@ if __name__ == "__main__":
         batch_divisor=BatchDivisor.global_batch,
         precision="amp_bf16",
         console_log_interval=log_interval,
+        compile_loss=True,
         speed_monitor=SpeedMonitorConfig(window_size=20),
         softmax_auxiliary_loss=True,
         softmax_auxiliary_loss_scale=1e-4,
-        activation_checkpointing=ActivationCheckpointingStrategy.whole_layer,
         eval_interval=eval_interval,
         inf_eval_interval=inf_eval_interval,
         inf_evaluators=evaluations,
-        eval_subset_num_batches=eval_subset_batches,
+        save_final_unsharded_checkpoint=False,
         evaluators=[]
     )
 
     conf = OmegaConf.create(cfg)
-    if other_args:
-        overrides = [clean_opt(arg) for arg in other_args]
-        conf = OmegaConf.merge(conf, OmegaConf.from_dotlist(overrides))
+    conf.merge_with_dotlist([clean_opt(arg) for arg in other_args])
     cfg = cast(TrainConfig, OmegaConf.to_object(conf))
-    train(cfg)
+    run_trainer(cfg)

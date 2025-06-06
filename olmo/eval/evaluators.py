@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import random
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
@@ -20,13 +21,17 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from torchmetrics import MeanMetric
 
-from .vqa import vqa_score, anls_metric, relaxed_correctness, \
-    a_okvqa_score, select_mc_option, mmmu_score, real_world_qa_score, math_vista_score
+from .vqa import vqa_score, anls_metric, relaxed_correctness, scifi_relaxed_correctness, \
+    a_okvqa_score, select_mc_option, mmmu_score, real_world_qa_score, math_vista_score, \
+    select_perception_test_option, select_ego_schema_option, nextqa_mc
+from .temp_compass_utils import temp_compass_score
+from .mlvu_utils import mlvu_ssc_score, mlvu_summary_score
 from ..html_utils import build_html_table, postprocess_prompt, BoxesToVisualize, \
     get_html_image_with_boxes
+from ..io import write_file
 from ..torch_util import (
     get_global_rank,
-    get_world_size,
+    get_world_size, barrier,
 )
 from ..util import flatten_list, extract_points, extract_bboxes, extract_points_from_point_count
 
@@ -86,16 +91,32 @@ def gather_examples_as_html(
         pred_seq = new_tokens[ix]
         pred_txt = voc.decode(pred_seq[pred_seq >= 0])
 
-        row = dict()
         image_src = None
         if "image_url" in metadata:
             image_src = metadata['image_url']
+        elif "image" in metadata and isinstance(metadata["image"], np.ndarray):
+            img = Image.fromarray(metadata["image"])
+            image_data = io.BytesIO()
+            img.save(image_data, format='JPEG')
+            image_data = image_data.getvalue()
+            image_src = f'data:image/jpeg;base64,{base64.b64encode(image_data).decode()}'
         elif "image" in metadata:
-            with Image.open(metadata["image"]) as img:
+            if isinstance(metadata["image"], str):
+                img = Image.open(metadata["image"])
+            elif isinstance(metadata["image"], Image.Image):
+                img = metadata["image"]
+            else:
+                img = None
+            if img is None:
+                image_src = None
+            else:
                 image_data = io.BytesIO()
+                img = img.convert("RGB")
                 img.save(image_data, format='JPEG')
                 image_data = image_data.getvalue()
-            image_src = f'data:image/jpeg;base64,{base64.b64encode(image_data).decode()}'
+                image_src = f'data:image/jpeg;base64,{base64.b64encode(image_data).decode()}'
+
+        row = dict()
         if image_src is not None:
             ex_pred_points, gt_pred_points = None, None
             if pred_points is not None:
@@ -123,7 +144,10 @@ def gather_examples_as_html(
         else:
             gt = None
         if gt is not None:
-            gt = "<br>".join(html_escape(x) for x in gt)
+            if isinstance(gt, list):
+                gt = "<br>".join(html_escape(x) for x in gt)
+            else:
+                gt = html_escape(gt)
             row["gt"] = gt
         if scores is not None:
             if isinstance(scores[ix], dict):
@@ -161,11 +185,12 @@ class SavePredictions(Evaluator):
         return filename
 
     def __init__(self, output_dir, json=True, save_tokens=True,
-                 log_examples=10):
+                 log_examples=10, table=True):
         self.save_tokens = save_tokens
         self.output_dir = output_dir
         self.log_examples = log_examples
         self.json = json
+        self.table = table
 
     def __call__(self, metadatas, predictions, tokenizer,
                  step=None, scores=None):
@@ -191,39 +216,87 @@ class SavePredictions(Evaluator):
             if self.save_tokens:
                 json_row["n_tokens"] = pred_seq.tolist()
             prompt_text = postprocess_prompt(tokenizer.decode(prompt_tokens[ex_ix][prompt_tokens[ex_ix] >= 0]))
-            if tokenizer.adds_space:
+            sep = ""
+            if hasattr(tokenizer, "adds_space") and tokenizer.adds_space: # HF tokenizer does not
                 sep = " "
-            else:
-                sep = ""
+                    
             json_row["prompt"] = prompt_text
             metadata = metadatas[ex_ix]
             if ex_ix < self.log_examples:
                 log.info("*"*30)
                 if "example_id" in metadata:
                     log.info(metadata['example_id'])
-                log.info(' '.join((prompt_text + sep + text).split()))
+                log.info(' '.join((prompt_text + sep + text.replace("\n", "\\n")).split()))
             json_row.update({k: v for k, v in metadata.items() if isinstance(v, (str, float, int))})
+
             json_data.append(json_row)
+        html_data = gather_examples_as_html(self.log_examples, tokenizer, metadatas, predictions)
 
         json_file = None
         html_file = None
         metrics = {}
 
+        # if self.json:
+        #     log.info("Save prediction JSON")
+        #     if get_world_size() > 1:
+        #         if get_global_rank() == 0:
+        #             all_predictions = [None]*get_world_size()
+        #             dist.gather_object(json_data, all_predictions)
+        #             json_data = flatten_list(all_predictions)
+        #         else:
+        #             dist.gather_object(json_data, None)
+
+
+        #     if get_global_rank() == 0:
+        #         write_file(
+        #             self.output_dir,
+        #             self.get_file_name(step, None) + ".json",
+        #             json.dumps(json_data, indent=2),
+        #             save_overwrite=True
+        #         )
+        #         log.info("done saving json")
+
         if self.json:
             log.info("Save prediction JSON")
-            if get_world_size() > 1 and self.json:
-                if get_global_rank() == 0:
-                    all_predictions = [None]*get_world_size()
-                    dist.gather_object(json_data, all_predictions)
-                    json_data = flatten_list(all_predictions)
-                else:
-                    dist.gather_object(json_data, None)
-
+            # Generate a unique filename for each process
+            rank = get_global_rank()
+            temp_json_file = f"{self.output_dir}/predictions_rank_{rank}.json"
+            
+            # Each process writes its own file
+            with open(temp_json_file, 'w') as f:
+                json.dump(json_data, f)
+            
+            # Make sure all processes have finished writing
+            dist.barrier()
+            
+            # Only the main process combines the files
             if get_global_rank() == 0:
-                json_file = os.path.join(self.output_dir, self.get_file_name(step, None) + ".json")
-                with open(json_file, "w") as f:
-                    json.dump(json_data, f)
-                log.info("done saving json")
+                combined_json_data = []
+                for r in range(get_world_size()):
+                    temp_file = f"{self.output_dir}/predictions_rank_{r}.json"
+                    with open(temp_file, 'r') as f:
+                        combined_json_data.extend(json.load(f))
+                
+                # Write the combined data
+                json_file = f"{self.output_dir}/predictions.json"
+                with open(json_file, 'w') as f:
+                    json.dump(combined_json_data, f)
+                
+                # Clean up temp files
+                for r in range(get_world_size()):
+                    temp_file = f"{self.output_dir}/predictions_rank_{r}.json"
+                    os.remove(temp_file)
+            
+        if self.table:
+            html_data = gather_examples_as_html(None, tokenizer, metadatas, predictions)
+            write_file(
+                self.output_dir,
+                self.get_file_name(step, None) + ".html",
+                html_data.get_html(),
+                save_overwrite=True
+                )
+            log.info("done saving html table for rank 0")
+
         return metrics
 
 
@@ -435,26 +508,29 @@ class PointingEval(Evaluator):
             image_w, image_h = metadata["image_size"]
             abs_preds = extract_points(pred, image_w, image_h)
 
-            if len(answer_points) == 0:
-                precision = recall = f1 = float(abs_preds is None or len(abs_preds) == 0)
-                abs_gts = None
-            else:
-                abs_gts = answer_points
-                if not is_valid_format(pred):
-                    precision = recall = f1 = 0.0
+            try:
+                if len(answer_points) == 0:
+                    precision = recall = f1 = float(abs_preds is None or len(abs_preds) == 0)
+                    abs_gts = None
                 else:
-                    abs_preds = np.array(abs_preds)
-                    dists = cdist(abs_preds, abs_gts)
-                    row_ind, col_ind = linear_sum_assignment(dists)
-                    precision = compute_precision(row_ind, col_ind, abs_preds, masks)
-                    recall = compute_recall(row_ind, col_ind, abs_preds, masks)
-                    f1 = f1_score(precision, recall)
-            scores["precision"].append(precision)
-            scores["recall"].append(recall)
-            scores["f1"].append(f1)
+                    abs_gts = answer_points
+                    if not is_valid_format(pred):
+                        precision = recall = f1 = 0.0
+                    else:
+                        abs_preds = np.array(abs_preds)
+                        dists = cdist(abs_preds, abs_gts)
+                        row_ind, col_ind = linear_sum_assignment(dists)
+                        precision = compute_precision(row_ind, col_ind, abs_preds, masks)
+                        recall = compute_recall(row_ind, col_ind, abs_preds, masks)
+                        f1 = f1_score(precision, recall)
+                scores["precision"].append(precision)
+                scores["recall"].append(recall)
+                scores["f1"].append(f1)
 
-            pred_points.append(abs_preds)
-            gt_points.append(abs_gts)
+                pred_points.append(abs_preds)
+                gt_points.append(abs_gts)
+            except Exception as e:
+                print(f"Error processing example {ex_ix}: {e}")
 
         out = {}
 
@@ -604,9 +680,11 @@ class MathVistaEval(Evaluator):
             _args.append((pred, metadatas[ex_ix], get_openai_key()))
 
         scores = []
+        barrier()
         with ThreadPoolExecutor(max_workers=self.n_threads) as pool:
             for score in pool.map(_math_vista_score, _args):
                 scores.append(score)
+        barrier()
 
         out = dict(score=mean_metric(scores))
         if self.n_to_log:
@@ -658,14 +736,37 @@ class VqaEval(Evaluator):
                     score = max(anls_metric(ref, pred) for ref in answers)
                 elif metric == "relaxed_correctness":
                     score = max(relaxed_correctness(ans, pred) for ans in answers)
+                elif metric == "scifi_relaxed_correctness":
+                    score = max(scifi_relaxed_correctness(ans, pred) for ans in answers)
                 elif metric == "a_okvqa_score":
                     score = a_okvqa_score(answers, pred)
                 elif metric == "em":
                     score = pred.lower() in [x.lower() for x in answers]
+                elif metric == "em_start":
+                    pred = pred.lower()
+                    pred = pred.strip().lstrip()  # deal with " B. ped"
+
+                    answer = answers[0].lower().strip().lstrip()  # match "B." to even "B)" or "B"
+                    answer = answer[0]
+
+                    # Limitation - might match even if pred is "A ball is seen" and GT is A.
+                    score = pred.startswith(answer)
+
                 elif metric == "mc":
                     options = metadata["option_names"]
                     get_answer_idx = select_mc_option(pred, options)
                     score = get_answer_idx == metadata["answer_idx"]
+                elif metric == "perception_test_mc":
+                    get_answer_idx = select_perception_test_option(pred)
+                    score = get_answer_idx == metadata["answer_idx"]
+                elif metric == "ego_schema_mc":
+                    options = metadata["options"]
+                    get_answer_idx = select_ego_schema_option(pred, options)
+                    score = get_answer_idx == metadata["answer_idx"]
+                elif metric == "nextqa_mc":
+                    options = metadata["options"]
+                    answer = answer[0]
+                    score = nextqa_mc(answer, pred, options)
                 elif metric in ["mc_ai2d_transparent", "mc_ai2d_opaque"]: # mc split by transparency
                     has_transparent_box = metadata["has_transparent_box"]
                     abc_label = metadata["abc_label"]
@@ -976,4 +1077,333 @@ class RefExpEval:
         for k in scores[0]:
             vals = [x[k] for x in scores if k in x]
             out[k] = mean_metric(vals)
+        return out
+
+
+TEMPORAL_ASPECTS = [
+    "action",
+    "direction",
+    "speed",
+    "order",
+    "attribute_change",
+]
+
+
+FINE_GRAINED_TEMPORAL_ASPECTS = [
+    "fine-grained action",
+    "coarse-grained action",
+    "object motion",
+    "camera motion",
+    "absolute speed",
+    "relative speed",
+    "order",
+    "color & light change",
+    "size & shape change",
+    "combined change",
+    "other change",
+]
+
+TEMP_COMPASS_TASKS = ["multi-choice", "yes_no", "caption_matching", "captioning"]
+
+
+class TempCompassEval(Evaluator):
+
+    def __init__(self, task="all", disable_api=False, n_to_log=None):
+        self.tasks = TEMP_COMPASS_TASKS if task == "all" else [task]
+        self.disable_api = disable_api
+        self.n_to_log = n_to_log
+    
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        score_lists = defaultdict(list)
+
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            task = metadata["task"]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            score = temp_compass_score(
+                pred, metadata, get_openai_key(), use_api=not self.disable_api,
+            )
+            score_lists[task].append(score)
+            score_lists["all"].append(score)
+    
+        out = {}
+        for k in self.tasks:
+            out[k] = mean_metric(score_lists[k])
+        out["all"] = mean_metric(score_lists["all"])
+
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, score_lists["all"]
+            )
+        return out
+
+
+VIDEO_MME_CATEGORIES = [
+    "Knowledge",
+    "Film & Television",
+    "Sports Competition",
+    "Artistic Performance",
+    "Life Record",
+    "Multilingual"
+]
+
+
+VIDEO_MME_SUB_CATEGORIES = [
+    "Humanity & History",
+    "Literature & Art",
+    "Biology & Medicine",
+    "Finance & Commerce",
+    "Astronomy",
+    "Geography",
+    "Law",
+    "Life Tip",
+    "Technology",
+    "Animation",
+    "Movie & TV Show",
+    "Documentary",
+    "News Report",
+    "Esports",
+    "Basketball",
+    "Football",
+    "Athletics",
+    "Other Sports",
+    "Stage Play",
+    "Magic Show",
+    "Variety Show",
+    "Acrobatics",
+    "Handicraft",
+    "Food",
+    "Fashion",
+    "Daily Life",
+    "Travel",
+    "Pet & Animal",
+    "Exercise",
+    "Multilingual"
+]
+
+
+VIDEO_MME_TASK_CATEGORIES = [
+    "Temporal Perception",
+    "Spatial Perception",
+    "Attribute Perception",
+    "Action Recognition",
+    "Object Recognition",
+    "OCR Problems",
+    "Counting Problem",
+    "Temporal Reasoning",
+    "Spatial Reasoning",
+    "Action Reasoning",
+    "Object Reasoning",
+    "Information Synopsis",
+]
+
+
+class VideoMMEEval(Evaluator):
+
+    def __init__(self, duration="all", n_to_log=None):
+        self.durations = ["short", "medium", "long"] if duration == "all" else [duration]
+        self.n_to_log = n_to_log
+    
+    def extract_characters_regex(self, s):
+        s = s.strip()
+        answer_prefixes = [
+            "The best answer is",
+            "The correct answer is",
+            "The answer is",
+            "The answer",
+            "The best option is"
+            "The correct option is",
+            "Best answer:"
+            "Best option:",
+            "Answer:",
+            "Option:",
+            "The correct answer",
+            "The correct option",
+        ]
+        for answer_prefix in answer_prefixes:
+            s = s.replace(answer_prefix, "")
+
+        if len(s.split()) > 10 and not re.search("[ABCD]", s):
+            return ""
+        matches = re.search(r'[ABCD]', s)
+        if matches is None:
+            return ""
+        return matches[0]
+    
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        score_lists = defaultdict(list)
+
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            pred = self.extract_characters_regex(pred)
+            answer = metadata["answer"]
+            if pred == "":
+                # I am not sure why, but the original code skipped if the extraction is an empty string
+                continue 
+            score = pred == answer
+
+            duration = metadata["duration"]
+
+            score_lists[f"{duration}"].append(score)
+            score_lists["all"].append(score)
+        
+        out = {}
+        for k in self.durations:
+            out[f"{k}"] = mean_metric(score_lists[f"{k}"])
+        out["all"] = mean_metric(score_lists["all"])
+
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, score_lists["all"]
+            )
+        return out
+
+
+def _mlvu_gen_score(args):
+    task_type = args.pop("task_type")
+    if task_type == "sub_scene":
+        return mlvu_ssc_score(**args)
+    else:
+        return mlvu_summary_score(**args)
+
+
+class MLVUGenEval(Evaluator):
+    
+    def __init__(self, n_to_log=None, n_threads=4):
+        self.n_to_log = n_to_log
+        self.n_threads = n_threads
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+
+        _args = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            _args.append(
+                dict(
+                    task_type=metadatas[ex_ix]["task_type"],
+                    prediction=pred,
+                    metadata=metadatas[ex_ix],
+                    openai_api_key=get_openai_key()
+                )
+            )
+
+        scores = []
+        barrier()
+        with ThreadPoolExecutor(max_workers=self.n_threads) as pool:
+            for score in pool.map(_mlvu_gen_score, _args):
+                scores.append(score)
+        barrier()
+
+        score_lists = defaultdict(list)
+        for score in scores:
+            for k, v in score.items():
+                score_lists[k].append(v)
+        out = {k: mean_metric(v) for k, v in score_lists.items()}
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, [sum(score.values()) for score in scores]
+            )
+        return out
+
+
+class LongVideoBenchEval(Evaluator):
+    DURATIONS = [15, 60, 600, 3600]
+    
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+
+    def parse_multi_choice_response(self, response, all_choices, index2ans):
+        """
+        Changed from MMMU-style complex parsing into simple parsing.
+        Fixed to avoid 'D. A book' be parsed as A.
+        Same as original LongVideoBench paper (from author Haoning Wu), if parsing failed, it will assign a random choice to model.
+        """
+        s = response.strip()
+        answer_prefixes = [
+            "The best answer is",
+            "The correct answer is",
+            "The answer is",
+            "The answer",
+            "The best option is",
+            "The correct option is",
+            "Best answer:",
+            "Best option:",
+        ]
+        for answer_prefix in answer_prefixes:
+            s = s.replace(answer_prefix, "")
+
+        if len(s.split()) > 10 and not re.search("[ABCDE]", s):
+            return random.choice(all_choices)
+
+        matches = re.search(r"[ABCDE]", s)
+        if matches is None:
+            return random.choice(all_choices)
+        return matches[0]
+    
+    def eval_multi_choice(self, gold_i, pred_i):
+        correct = False
+        # only they are exactly the same, we consider it as correct
+        if isinstance(gold_i, list):
+            for answer in gold_i:
+                if answer == pred_i:
+                    correct = True
+                    break
+        else:  # gold_i is a string
+            if gold_i == pred_i:
+                correct = True
+        return correct
+    
+    def get_multi_choice_info(self, options):
+        """
+        Given the list of options for multiple choice question
+        Return the index2ans and all_choices
+        https://github.com/MMMU-Benchmark/MMMU/blob/51ce7f3e829c16bb44bc5445782686b4c3508794/eval/data_utils.py#L54
+        """
+
+        start_chr = "A"
+        all_choices = []
+        index2ans = {}
+        for i, option in enumerate(options):
+            index2ans[chr(ord(start_chr) + i)] = option
+            all_choices.append(chr(ord(start_chr) + i))
+
+        return index2ans, all_choices
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        score_lists = defaultdict(list)
+
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            index2ans, all_choices = self.get_multi_choice_info(metadata["options"])
+
+            parsed_pred = self.parse_multi_choice_response(pred, all_choices, index2ans)
+            score = self.eval_multi_choice(metadata["answer"], parsed_pred)
+
+            duration_group = metadata["duration_group"]
+            score_lists[f"duration_{duration_group}"].append(score)
+            score_lists["all"].append(score)
+        
+        out = {}
+        for k in self.DURATIONS:
+            out[f"duration_{k}"] = mean_metric(score_lists[f"duration_{k}"])
+        out["all"] = mean_metric(score_lists["all"])
+
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, score_lists["all"]
+            )
         return out

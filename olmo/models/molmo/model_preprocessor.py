@@ -1,13 +1,16 @@
 import dataclasses
-from typing import List, Optional, Union, Tuple
+import math
+from typing import List, Optional, Union, Any, Tuple
 
 import PIL
 from PIL import ImageFile
 from einops import einops
 
+from olmo import tokenizer
 from olmo.config import BaseConfig
-from olmo.data.image_preprocessor import ImagePreprocessor, load_image
+from olmo.data.image_preprocessor import load_image, ImagePreprocessor
 from olmo.data.interleaved_text_preprocessor import InterleavedTextPreprocessor
+from olmo.tokenizer import get_special_token_ids
 from olmo.nn.vision_backbone import MolmoVisionBackboneConfig
 
 
@@ -20,7 +23,9 @@ import numpy as np
 import torch
 
 from transformers.image_utils import (
-    ImageInput
+    OPENAI_CLIP_MEAN,
+    OPENAI_CLIP_STD,
+    ImageInput,
 )
 
 from olmo.models.molmo.data_formatter import DataFormatter
@@ -29,7 +34,7 @@ from olmo.models.molmo.data_formatter import DataFormatter
 def batch_pixels_to_patches(array, patch_size):
     """Reshape images of [n_images, h, w, 3] -> [n_images, n_patches, pixels_per_patch]"""
     if len(array.shape) == 3:
-        n_crops, h, w = array.shape
+        n_crops, w, h = array.shape
         h_patches = h//patch_size
         w_patches = w//patch_size
         array = np.reshape(array, [n_crops, h_patches, patch_size, w_patches, patch_size])
@@ -37,7 +42,7 @@ def batch_pixels_to_patches(array, patch_size):
         array = np.reshape(array, [n_crops, h_patches*w_patches, patch_size*patch_size])
         return array
     else:
-        n_crops, h, w, c = array.shape
+        n_crops, w, h, c = array.shape
         h_patches = h//patch_size
         w_patches = w//patch_size
         array = np.reshape(array, [n_crops, h_patches, patch_size, w_patches, patch_size, c])

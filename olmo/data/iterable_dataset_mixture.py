@@ -1,12 +1,12 @@
 import dataclasses
 import logging
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Union
 
 import numpy as np
 import torch
-from torch.utils.data import Sampler
 
 from olmo.data.dataset import DeterministicDataset
+from olmo.hf_train.dataset import HFDeterministicDataset
 from olmo.torch_util import get_world_size, get_global_rank
 
 log = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
 
     def __init__(
         self,
-        datasets: List[DeterministicDataset],
+        datasets: List[Union[DeterministicDataset, HFDeterministicDataset]],
         global_batch_size: int,
         mixture_rates: List[float]=None,
         seed: int = 0,
@@ -46,6 +46,12 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
         self.stratify = stratify
         self.worker_info = worker_info  # For testing
 
+    def __len__(self):
+        if self.mixture_rates is not None:
+            return int(np.ceil(sum(len(d) * r for d, r in zip(self.datasets, self.mixture_rates))))
+        else:
+            return int(np.ceil(sum(len(d) for d in self.datasets)))
+    
     def _get_next_sources(self, rng, counts):
         if len(self.datasets) == 1:
             return np.zeros(self.global_batch_size, dtype=np.int32)
@@ -107,6 +113,8 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
 
                 if (i + self.rank) % self.world_size != 0:
                     continue
+                device_ix = (i + self.rank) // self.world_size
+
                 dataset = self.datasets[dataset_ix]
                 epoch = count // len(dataset)
 

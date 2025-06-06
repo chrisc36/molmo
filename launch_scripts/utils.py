@@ -1,22 +1,47 @@
 import logging
-import re
-from dataclasses import replace
-from pathlib import Path
 from typing import Dict
-
-import numpy as np
+from dataclasses import replace
 
 from olmo.models.molmo.data_formatter import DataFormatter
 from olmo.models.molmo.model_preprocessor import MolmoPreprocessorConfig
-from olmo.models.molmo.molmo import MolmoConfig
-from olmo.nn.vision_backbone import MolmoVisionBackboneConfig
-from olmo.tokenizer import TokenizerConfig
-
 from olmo.data.data_loader import DataLoaderConfig
-from olmo.eval.inf_evaluator import EvaluatorConfig, InfDatasetEvaluatorConfig
+from olmo.hf_train.data_loader import HFDataLoaderConfig
+from olmo.eval.inf_evaluator import InfDatasetEvaluatorConfig, EvaluatorConfig
 from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.nn.image_vit import VitConfig
-from olmo.nn.llm import LlmConfig, LayerNormType, AttentionType
+from olmo.nn.llm import LlmConfig, AttentionType, LayerNormType
+from olmo.models.molmo.molmo import MolmoConfig
+from olmo.tokenizer import TokenizerConfig
+from olmo.nn.vision_backbone import MolmoVisionBackboneConfig
+
+log = logging.getLogger(__name__)
+
+import os
+
+MOLMO_DATA_DIR=os.getenv("MOLMO_DATA_DIR")
+
+
+DEBUG_MODEL = MolmoConfig(
+    llm=LlmConfig(
+        d_model=128,
+        n_heads=2,
+        n_layers=1,
+        max_sequence_length=4096,
+        additional_vocab_size=128,
+        vocab_size=152064,
+        rope=True,
+        embedding_size=None,
+        weight_tying=False,
+        tokenizer=TokenizerConfig(
+            identifier="Qwen/Qwen2-7B",
+        )
+    ),
+    vision_backbone=MolmoVisionBackboneConfig(
+        vit=VitConfig(image_num_layers=1)
+    ),
+    data_formatter=DataFormatter(),
+    mm_preprocessor=MolmoPreprocessorConfig(crop_mode="resize", max_crops=1)
+)
 
 
 def get_evaluator(name) -> EvaluatorConfig:
@@ -33,7 +58,7 @@ def get_evaluator(name) -> EvaluatorConfig:
     elif name == "vqa_v2_test":
         return EvaluatorConfig()
     elif name.startswith("chart_qa"):
-        return EvaluatorConfig(vqa_eval="relaxed_correctness,em")
+        return EvaluatorConfig(vqa_eval="relaxed_correctness,scifi_relaxed_correctness,em")
     elif name in ["doc_qa", "info_qa", "st_qa"]:
         return EvaluatorConfig(vqa_eval="ansl,em")
     elif name in ["gqa", "tally_qa"]:
@@ -48,7 +73,7 @@ def get_evaluator(name) -> EvaluatorConfig:
         return EvaluatorConfig(point_count_eval=True)
     elif name.startswith("real_world_qa"):
         return EvaluatorConfig(vqa_eval="real_world_qa_score")
-    elif name == "clocks":
+    elif name == "pixmo_clocks":
         return EvaluatorConfig(clock_eval=True)
     elif name == "pointing_eval":
         return EvaluatorConfig(pointing_eval=True)
@@ -56,17 +81,55 @@ def get_evaluator(name) -> EvaluatorConfig:
         return EvaluatorConfig(clock_bench_eval=True)
     elif name in ["countbench_qa"]:
         return EvaluatorConfig(count_eval=True)
-    elif name in ["dense_caption_eval", "user_qa", "vqa_v2_test"]:
+    elif name in ["dense_caption_eval", "user_qa"]:
         # No metrics, but still save prediction file
         return EvaluatorConfig()
     else:
         raise NotImplementedError(name)
 
+def get_hf_evaluation(name, seq_len, max_examples, for_inference=True,
+                   num_workers=2, device_batch_size=None, persistent_workers=False) -> InfDatasetEvaluatorConfig:
+    """Gets the default evaluation config for task (or task:split string) `name`"""
+    if ":" in name:
+        name, split = name.split(":")
+    else:
+        split = None
 
-def get_default_max_tokens(name):
-    if name == "dense_caption_eval":
-        return 448
-    elif name.startswith("named_entity"):
+    if name == "chart_qa_weighted":
+        name = "chart_qa"
+    if name == "coco_2014_vqa_multi":
+        name = "coco_2014_vqa"
+
+    eval_only_tasks = ["mmmu", "mme", "math_vista", "real_world_qa", "seed_bench",
+                       "mmbench", "sugar_crepe", "blink"]
+    eval_only_tasks += [task_name + "_test" for task_name in eval_only_tasks]
+    if name == "tall_qa_count":
+        task_name = "tally_qa"
+    elif name in eval_only_tasks:
+        task_name = name + "_test" if not name.endswith("_test") else name
+    else:
+        task_name = name
+    test_eval_tasks = ["mme_test", "real_world_qa_test", "real_world_qa_test", "count_bench",
+                       "seed_bench_test", "sugar_crepe_test", "count_bench_from_caption", "pointing_test"]
+    if split is None:
+        split = "test" if task_name in test_eval_tasks else "validation"
+
+    ds = HFDataLoaderConfig(
+        dataset=task_name, sequence_length=seq_len,
+        split=split, shuffle=True, 
+        drop_last=max_examples is not None and max_examples >= 0,
+        num_workers=num_workers, pad="to_max", pin_memory=True,
+        seed=691203,
+        persistent_workers=persistent_workers
+    )
+
+    evaluator = get_evaluator(name)
+    evaluator.num_wandb_examples = 64
+    evaluator.num_wandb_examples = 32
+    evaluator.n_to_log = 0
+    evaluator.save_predictions = None
+
+    if name.startswith("named_entity"):
         max_new_tokens = 256
     elif name == "math_vista_demo":
         max_new_tokens = 384
@@ -82,12 +145,22 @@ def get_default_max_tokens(name):
         max_new_tokens = 64
     elif name.startswith("android_control"):
         max_new_tokens = 16
-    elif "refc" in name:
+    elif name == "llava_video_178k_oe" or name == "llava_video_178k_cap" or name.startswith("temp_compass"):
+        max_new_tokens = 192
+    elif "refc" in name or "mvbench" in name or name == "llava_video_178k_mc":
         max_new_tokens = 32
     else:
         max_new_tokens = 12
-    return max_new_tokens
 
+    return InfDatasetEvaluatorConfig(
+        max_examples=max_examples,
+        device_batch_size=device_batch_size,
+        max_new_tokens=max_new_tokens,
+        evaluator=evaluator,
+        label="ai2_diagram" if "ai2_diagram" in name else name,
+        data=ds,
+        console_log_interval="${console_log_interval}"  # Use log interval in top-level config
+    )
 
 def get_evaluation(name, seq_len, max_examples, for_inference=True,
                    num_workers=2, device_batch_size=None,
@@ -119,7 +192,7 @@ def get_evaluation(name, seq_len, max_examples, for_inference=True,
 
     ds = DataLoaderConfig(
         dataset=task_name, sequence_length=seq_len,
-        split=split, shuffle=True,
+        split=split, shuffle=True, 
         drop_last=max_examples is not None and max_examples >= 0,
         num_workers=num_workers, pad="to_max", pin_memory=True,
         seed=691203,
@@ -133,7 +206,30 @@ def get_evaluation(name, seq_len, max_examples, for_inference=True,
         evaluator.n_to_log = 0
         evaluator.save_predictions = None
 
-        max_new_tokens = get_default_max_tokens(name)
+        if name.startswith("named_entity"):
+            max_new_tokens = 256
+        elif name == "math_vista_demo":
+            max_new_tokens = 384
+        elif name in ["chart_qa_scifi", "chart_qa_ex", "chart_qa_exp", "chart_qa_prompting_explanation"] or name.endswith("_demo"):
+            max_new_tokens = 256
+        elif name.startswith("user_questions_for_elo"):
+            max_new_tokens = 768  # Can have counts of 20+ so make sure there is room
+        elif name in ["pointing_eval", "pointing"]:
+            max_new_tokens = 192  # 192 is enought for counts <=10 in the point tag format
+        elif "countbench_qa" in name or "pixmo_count" in name:
+            max_new_tokens = 192
+        elif name == "android_control_hl_cot":
+            max_new_tokens = 64
+        elif name.startswith("android_control"):
+            max_new_tokens = 16
+        elif name == "llava_video_178k_oe" or name == "llava_video_178k_cap" or name.startswith("temp_compass") or name == "mlvu_gen":
+            max_new_tokens = 192
+        elif "refc" in name or "mvbench" in name or name == "llava_video_178k_mc":
+            max_new_tokens = 32
+        elif name == "ego_schema":
+            max_new_tokens = 32
+        else:
+            max_new_tokens = 12
 
         return InfDatasetEvaluatorConfig(
             max_examples=max_examples,
@@ -145,7 +241,7 @@ def get_evaluation(name, seq_len, max_examples, for_inference=True,
             console_log_interval="${console_log_interval}",  # Use log interval in top-level config
             include_image=include_image,
         )
-
+            
     else:
         return LossDatasetEvaluatorConfig(
             max_examples=max_examples,
@@ -156,34 +252,11 @@ def get_evaluation(name, seq_len, max_examples, for_inference=True,
         )
 
 
-DEBUG_MODEL = MolmoConfig(
-    llm=LlmConfig(
-        d_model=128,
-        n_heads=2,
-        n_layers=1,
-        max_sequence_length=4096,
-        additional_vocab_size=128,
-        vocab_size=152064,
-        rope=True,
-        embedding_size=None,
-        weight_tying=False,
-        tokenizer=TokenizerConfig(
-            identifier="Qwen/Qwen2-7B",
-        )
-    ),
-    vision_backbone=MolmoVisionBackboneConfig(
-        vit=VitConfig(image_num_layers=1)
-    ),
-    data_formatter=DataFormatter(),
-    mm_preprocessor=MolmoPreprocessorConfig(crop_mode="resize", max_crops=1)
-)
-
-
 DEBUG_VISION_BACKBONE = VitConfig(
     init_path=None,
     resize_mode="siglip",
     image_model_type="openai",
-    image_default_input_size=(378, 378),
+    image_default_input_size=(336, 336),
     image_patch_size=14,
     image_pos_patch_size=14,
     image_emb_dim=128,
@@ -203,7 +276,7 @@ DEBUG_VISION_BACKBONE = VitConfig(
 
 
 DEFAULT_VISION_BACKBONE = VitConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/vit-l-14-336.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_image_encoders/vit-l-14-336.pt",
     image_model_type="openai",
     image_default_input_size=(336, 336),
     image_patch_size=14,
@@ -225,7 +298,7 @@ DEFAULT_VISION_BACKBONE = VitConfig(
 
 
 SIGLIP_VISION_BACKBONE = VitConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/siglip-so400m-14-384.pt",
+    init_path=f"{MOLMO_DATA_DIR}//pretrained_image_encoders/siglip-so400m-14-384.pt",
     image_model_type="siglip",
     image_default_input_size=(378, 378),
     image_patch_size=14,
@@ -244,18 +317,17 @@ SIGLIP_VISION_BACKBONE = VitConfig(
     residual_dropout=0.0,
     initializer_range=0.02,
     resize_mode="siglip",
-    normalize="siglip"
 )
 
 
 SIGLIP2_VISION_BACKBONE = replace(
     SIGLIP_VISION_BACKBONE,
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/siglip2-so400m-14-384.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_image_encoders/siglip2-so400m-14-384.pt",
 )
 
 
 DINOV2_LARGE_336_VISION_BACKBONE = VitConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/dinov2-large-336.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_image_encoders/dinov2-large-336.pt",
     image_model_type="dino",
     image_default_input_size=(336, 336),
     image_patch_size=14,
@@ -274,12 +346,11 @@ DINOV2_LARGE_336_VISION_BACKBONE = VitConfig(
     residual_dropout=0.0,
     initializer_range=0.02,
     resize_mode="dino",
-    normalize="dino",
 )
 
 
 METACLIP_L14_336_VISION_BACKBONE = VitConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/metaclip-l14-336.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_image_encoders/metaclip-l14-336.pt",
     image_model_type="openai",
     image_default_input_size=(336, 336),
     image_patch_size=14,
@@ -302,7 +373,7 @@ METACLIP_L14_336_VISION_BACKBONE = VitConfig(
 
 
 OLMOE = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmoe.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/olmoe.pt",
     d_model=2048,
     n_heads=16,
     n_layers=16,
@@ -354,7 +425,7 @@ OLMOE = LlmConfig(
 
 
 OLMO_1024_PREVIEW = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmo-1024-preview.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/olmo-1024-preview.pt",
     d_model=4096,
     n_heads=32,
     n_kv_heads=None,
@@ -392,7 +463,7 @@ OLMO_1024_PREVIEW = LlmConfig(
 
 OLMO2_1124_7B = replace(
     OLMO_1024_PREVIEW,
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmo2-1124-7b.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/olmo2-1124-7b.pt",
     tokenizer=TokenizerConfig(
         identifier="allenai/OLMo-2-1124-7B",
     ),
@@ -401,7 +472,7 @@ OLMO2_1124_7B = replace(
 
 OLMO2_1124_13B = replace(
     OLMO_1024_PREVIEW,
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmo2-1124-13b.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/olmo2-1124-13b.pt",
     d_model=5120,
     n_heads=40,
     n_layers=40,
@@ -412,18 +483,10 @@ OLMO2_1124_13B = replace(
 )
 
 
-OLMO2_1124_13B_INSTRUCT = replace(
-    OLMO2_1124_13B,
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmo2-1124-13b-instruct.pt",
-    tokenizer=TokenizerConfig(
-        identifier="allenai/OLMo-2-1124-13B-Instruct",
-    ),
-)
-
 
 OLMO2_0325_32B = replace(
     OLMO_1024_PREVIEW,
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmo2-0325-32b.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/olmo2-0325-32b.pt",
     d_model=5120,
     n_heads=40,
     n_kv_heads=8,
@@ -435,17 +498,8 @@ OLMO2_0325_32B = replace(
 )
 
 
-OLMO2_0325_32B_INSTRUCT = replace(
-    OLMO2_0325_32B,
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmo2-0325-32b-instruct.pt",
-    tokenizer=TokenizerConfig(
-        identifier="allenai/OLMo-2-0325-32B-Instruct",
-    ),
-)
-
-
 QWEN2_7B = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2-7b.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2-7b.pt",
     vocab_size=152064,
     max_sequence_length=4096,
     residual_dropout=0,
@@ -473,7 +527,7 @@ QWEN2_7B = LlmConfig(
 
 
 QWEN25_15B = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-1.5b.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-1.5b.pt",
     vocab_size=151936,
     max_sequence_length=4096,
     residual_dropout=0,
@@ -501,7 +555,7 @@ QWEN25_15B = LlmConfig(
 
 
 QWEN25_3B = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-3b.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-3b.pt",
     vocab_size=151936,
     max_sequence_length=4096,
     residual_dropout=0,
@@ -529,7 +583,7 @@ QWEN25_3B = LlmConfig(
 
 
 QWEN25_7B = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-7b.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-7b.pt",
     vocab_size=152064,
     max_sequence_length=4096,
     residual_dropout=0,
@@ -555,49 +609,8 @@ QWEN25_7B = LlmConfig(
     ),
 )
 
-
-QWEN25_14B = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-14b.pt",
-    vocab_size=152064,
-    max_sequence_length=4096,
-    residual_dropout=0,
-    embedding_dropout=0,
-    response_residual_dropout=0,
-    attention_dropout=0,
-    rope=True,
-    qkv_bias=True,
-    weight_tying=False,
-    include_bias=False,
-    embedding_size=152064,
-    d_model=5120,
-    mlp_hidden_size=13824*2,
-    n_layers=48,
-    additional_vocab_size=128,
-    n_heads=40,
-    n_kv_heads=8,
-    rope_theta=1000000.0,
-    layer_norm_eps=1e-5,
-    layer_norm_type=LayerNormType.rms,
-    tokenizer=TokenizerConfig(
-        identifier="Qwen/Qwen2.5-14B",
-    ),
-)
-
-
-QWEN25_14B_INSTRUCT = replace(
-    QWEN25_14B,
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-14b-instruct.pt",
-    tokenizer=TokenizerConfig(
-        identifier="Qwen/Qwen2.5-14B-Instruct",
-    ),
-    layer_norm_eps=1e-6,
-    # The only difference is the layer norm eps
-    # and the tokenizer identifier
-)
-
-
 QWEN2_72B = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2-70b.pt",
+    init_path=f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2-70b.pt",
     additional_vocab_size=128,
     vocab_size=152064,
     max_sequence_length=4096,
@@ -624,17 +637,55 @@ QWEN2_72B = LlmConfig(
 )
 
 
+OMLO_19_13B = LlmConfig(
+    d_model=5120,
+    n_heads=40,
+    n_kv_heads=None,
+    clip_qkv=None,
+    n_layers=40,
+    mlp_ratio=4,
+    mlp_hidden_size=27648,
+    activation_type="swiglu",
+    block_type="sequential",
+    rope=True,
+    rope_full_precision=True,
+    rope_theta=500000,
+    attention_dropout=0.0,
+    attention_layer_norm=True,
+    layer_norm_type="rms",
+    layer_norm_with_affine=True,
+    layer_norm_eps=1.0e-06,
+    attention_layer_norm_with_affine=True,
+    max_sequence_length=4096,
+    include_bias=False,
+    bias_for_layer_norm=False,
+    scale_logits=False,
+    vocab_size=100278,
+    embedding_size=100352,
+    weight_tying=False,
+    attention_type=AttentionType.sdpa,
+    init_fn="normal",
+    init_std=0.02,
+    init_cutoff_factor=3.0,
+    norm_after=True,
+    tokenizer=TokenizerConfig(
+        identifier="allenai/dolma2-tokenizer",
+    ),
+    embedding_dropout=0,
+)
+
+
 DEFAULT_LOAD_PATHS = {
-    "openai": "${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/vit-l-14-336.pt",
-    "siglip": "${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/siglip-so400m-14-384.pt",
-    "dinov2_large_336": "${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/dinov2-large-336.pt",
-    "metaclip_l14_336": "${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/metaclip-l14-336.pt",
-    "olmoe": "${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmoe.pt",
-    "olmo_1024_preview": "${oc.env:MOLMO_DATA_DIR}/pretrained_llms/olmo-1024-preview.pt",
-    "qwen2.5_1.5b": "${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-1.5b.pt",
-    "qwen2.5_3b": "${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-3b.pt",
-    "qwen2_7b": "${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2-7b.pt",
-    "qwen2_72b": "${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen2-70b.pt",
+    "openai": f"{MOLMO_DATA_DIR}/pretrained_image_encoders/vit-l-14-336.pt",
+    "siglip": f"{MOLMO_DATA_DIR}/pretrained_image_encoders/siglip-so400m-14-384.pt",
+    "dinov2_large_336": f"{MOLMO_DATA_DIR}/pretrained_image_encoders/dinov2-large-336.pt",
+    "metaclip_l14_336": f"{MOLMO_DATA_DIR}/pretrained_image_encoders/metaclip-l14-336.pt",
+    "olmoe": f"{MOLMO_DATA_DIR}/pretrained_llms/olmoe.pt",
+    "olmo_1024_preview": f"{MOLMO_DATA_DIR}/pretrained_llms/olmo-1024-preview.pt",
+    "qwen2.5_1.5b": f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-1.5b.pt",
+    "qwen2.5_3b": f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2.5-3b.pt",
+    "qwen2_7b": f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2-7b.pt",
+    "qwen2_72b": f"{MOLMO_DATA_DIR}/pretrained_llms/qwen2-70b.pt",
 }
 
 
@@ -653,15 +704,12 @@ LLMS: Dict[str, LlmConfig] = {
     "olmo_1024_preview": OLMO_1024_PREVIEW,
     "olmo2_1124_7b": OLMO2_1124_7B,
     "olmo2_1124_13b": OLMO2_1124_13B,
-    "olmo2_1124_13b_instruct": OLMO2_1124_13B_INSTRUCT,
     "olmo2_0325_32b": OLMO2_0325_32B,
-    "olmo2_0325_32b_instruct": OLMO2_0325_32B_INSTRUCT,
     "qwen2_7b": QWEN2_7B,
     "qwen2_72b": QWEN2_72B,
-    "qwen2.5_14b_instruct": QWEN25_14B_INSTRUCT,
-    "qwen2.5_14b": QWEN25_14B,
     "qwen2.5_7b": QWEN25_7B,
     "qwen2.5_3b": QWEN25_3B,
     "qwen2.5_1.5b": QWEN25_15B,
+    "olmo1120_13b": OMLO_19_13B,
 }
 

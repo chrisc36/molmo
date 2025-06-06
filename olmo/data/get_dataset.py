@@ -1,8 +1,22 @@
-from olmo.data.pixmo_datasets import *
-from olmo.data.academic_datasets import *
+from olmo.data.academic_datasets import (
+    ScienceQAImageOnly, OkVqa,
+    TabWMPDirectAnswer,
+    AndroidControl, AI2D, CountBenchQa, RealWorldQa, MathVista, MMMU, ClockBench
+)
+from olmo.data.academic_datasets_manual import (
+    ChartQa, InfoQa, SceneTextQa, DocQa,
+    TextVqa, AOkVqa, Vqa2, PlotQa, TallyQa, FigureQa, DvQa,
+)
+from olmo.data.dataset import Dataset
+from olmo.data.pixmo_datasets import (
+    PixMoDocs, PixMoCount, PixMoPoints, PixMoCapQa, PixMoCap, PixMoPointExplanations,
+    PixMoAskModelAnything, PixMoPointsEval, DenseCaptionEval, PixMoClocks,
+    CoSyn, CoSynPoint
+)
+import itertools
 
 
-def get_dataset_by_name(dataset_name, split):
+def get_dataset_by_name(dataset_name, split) -> Dataset:
     if dataset_name in ["scifi_document_qa", "pixmo_docs_other"]:
         return PixMoDocs("other", split=split)
     elif dataset_name in ["scifi_table_qa", "pixmo_docs_tables"]:
@@ -11,6 +25,28 @@ def get_dataset_by_name(dataset_name, split):
         return PixMoDocs("diagrams", split=split)
     elif dataset_name in ["scifi_charts_qa", "pixmo_docs_charts"]:
         return PixMoDocs("charts", split=split)
+
+    elif dataset_name in ["pixmo_docs_other_flat"]:
+        return PixMoDocs("other", split=split, flat=True)
+    elif dataset_name in ["pixmo_docs_charts_flat"]:
+        return PixMoDocs("charts", split=split, flat=True)
+    elif dataset_name in ["pixmo_docs_tables_flat"]:
+        return PixMoDocs("tables", split=split, flat=True)
+    elif dataset_name in ["pixmo_docs_diagrams_flat"]:
+        return PixMoDocs("diagrams", split=split, flat=True)
+
+    # CoSyn-400K / CoSyn-point
+    doc_types = [
+        "chart", "chemical", "circuit", "diagram",
+        "document", "graphic", "math", "music",
+        "nutrition", "table"
+    ]
+    cosyn_dataset_names = [f"cosyn_{doc_type}{suffix}" for doc_type, suffix in itertools.product(doc_types, ["", "_exp"])]
+    if dataset_name == "cosyn_point":
+        return CoSynPoint(split=split)
+    elif dataset_name in cosyn_dataset_names:
+        doc_type = dataset_name.split("_")[1]
+        return CoSyn(doc_type, split=split, use_exp=dataset_name.endswith("_exp"))
 
     # PixMo-Pointing
     elif dataset_name in ["pointing_high_freq", "pixmo_points_high_freq"]:
@@ -21,6 +57,14 @@ def get_dataset_by_name(dataset_name, split):
         return PixMoPoints(kind="basic", split=split, counting=False)
     elif dataset_name in ["point_count", "pixmo_points_counting"]:
         return PixMoPoints(kind="basic", split=split, counting=True)
+
+    # More than 60 points will start getting truncated anyway with a seq. len of 2304
+    elif dataset_name in ["pixmo_points_train"]:
+        return PixMoPoints(kind="basic", split=split, counting="both", max_points=60, max_total_points_per_example=60)
+    elif dataset_name in ["pixmo_points_high_freq_train"]:
+        return PixMoPoints(kind="high_frequency", split=split, counting="both", max_points=60, max_total_points_per_example=60)
+    elif dataset_name in ["pixmo_count_train"]:
+        return PixMoCount(split=split, counting="both")
 
     # PixMo-Point-Explanations
     elif dataset_name in ["point_qa", "pixmo_pointing_explanations"]:
@@ -37,14 +81,25 @@ def get_dataset_by_name(dataset_name, split):
         return PixMoAskModelAnything(split=split)
 
     # PixMo-CapQa
-    elif dataset_name in ["synthetic_qa_v3_as_user_qa", "pixmo_cap_qa"]:
+    elif dataset_name in ["synthetic_qa_v3", "pixmo_cap_qa"]:
         return PixMoCapQa(split=split)
+    elif dataset_name in ["synthetic_qa_v3_as_user_qa", "pixmo_cap_qa_as_user_qa"]:
+        return PixMoCapQa(split=split, style="user_qa")
 
     # PixMo-Cap
     if dataset_name in ["cockatoo_and_transcript_712k_sept6", "pixmo_cap_with_transcripts"]:
         return PixMoCap(split, mode="transcript_and_caption")
     if dataset_name in ["cockatoo_712k_sept6", "pixmo_cap"]:
         return PixMoCap(split, mode="captions")
+    if dataset_name in ["pixmo_cap_transcript", "pixmo_transcript"]:
+        return PixMoCap(split, mode="transcript")
+    # if dataset_name in ["cockatoo_712k_sept6", "pixmo_cap"]:
+    #     return PixMoCap(split, mode="captions")
+    # if dataset_name in ["pixmo_transcript"]:
+    #     return PixMoCap(split, mode="transcript")
+
+    elif dataset_name in ["pixmo_clocks"]:
+        return PixMoClocks(split=split)
 
     if dataset_name == "pointing_eval":
         assert split == "test"
@@ -57,6 +112,8 @@ def get_dataset_by_name(dataset_name, split):
         return AndroidControl(split, mode="ll")
     if dataset_name == "chart_qa":
         return ChartQa(split, weighted=False)
+    if dataset_name == "chart_qa_exp":
+        return ChartQa(split, weighted=False, use_exp=True)
     if dataset_name == "real_world_qa_no_instruction":
         assert split == "test"
         return RealWorldQa("no_instruction")
@@ -75,11 +132,11 @@ def get_dataset_by_name(dataset_name, split):
     if dataset_name == "text_vqa":
         return TextVqa(split)
     if dataset_name == "plot_qa":
-        return PlotQa(split, in_memory=False)
+        return PlotQa(split)
     if dataset_name == "figure_qa":
         return FigureQa(dict(train="train", validation="validation1")[split])
     if dataset_name == "dv_qa":
-        return DvQa(split, in_memory=False)
+        return DvQa(split)
     if dataset_name == "okvqa":
         return OkVqa(split)
     if dataset_name in ["mmmu"]:
@@ -103,6 +160,9 @@ def get_dataset_by_name(dataset_name, split):
         return AI2D(split=split, boxes="both")
     if dataset_name == "clock_bench":
         return ClockBench(split=split)
+    if dataset_name == "dense_caption_eval":
+        assert split == "test"
+        return DenseCaptionEval()
     elif dataset_name == "math_vista_v2":
         if split == "validation":
             split = "testmini"

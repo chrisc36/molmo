@@ -1,9 +1,12 @@
-# import ujson as json
+from __future__ import annotations
+
 import logging
+import time
 from dataclasses import dataclass
 from os import environ
 from typing import List, Optional
 
+import requests
 from transformers import AutoTokenizer
 
 from .config import BaseConfig
@@ -31,7 +34,7 @@ class HfTokenizerWrapper:
     """Tokenizer wrapper
 
     This exists mostly for legacy reasons since we used to support other kinds of tokenizers
-    with different API
+    with different APIs
     """
     def __init__(self, tokenizer, bos_token_id=None, adds_space=False):
         self.adds_space = adds_space
@@ -91,11 +94,16 @@ def build_tokenizer(
     # Stop multiple processes on one node trying to download and cache the tokenizer
     # files, which seems to rarely cause an error
     if get_local_rank() == 0:
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_type,
-            token=environ.get("HF_ACCESS_TOKEN"),
-            cache_dir=cache_dir,
-        )
+        for i in range(3):
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_type,
+                    token=environ.get("HF_ACCESS_TOKEN"),
+                    cache_dir=cache_dir,
+                )
+            except requests.exceptions.ReadTimeout as e:
+                logging.warning(f"Failed to download tokenizer, re-trying. Exception: {e}")
+                time.sleep(1)
     barrier()
 
     extra_tokens = list(EXTRA_TOKENS)
@@ -118,10 +126,9 @@ def build_tokenizer(
         token=environ.get("HF_ACCESS_TOKEN"),
         cache_dir=cache_dir,
     )
-    if ("qwen2" in tokenizer_type.lower()) or ("olmo" in tokenizer_type.lower()):
+    if tokenizer.bos_token_id is None:
         # These tokenizers do not have a BOS, and instead use EOS as a generic seperator token.
         # In this case we will use EOS as BOS
-        assert tokenizer.bos_token_id is None
         bos_token_id = tokenizer.eos_token_id
 
     if pad_tokenizer_to is not None:

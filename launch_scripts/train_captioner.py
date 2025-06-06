@@ -5,56 +5,37 @@ from typing import cast
 
 from omegaconf import omegaconf, OmegaConf
 
-from launch_scripts.utils import DEBUG_MODEL, VISION_BACKBONES, LLMS, DEFAULT_LOAD_PATHS
-from olmo.data.data_loader import DataLoaderConfig
-from olmo.data.pixmo_datasets import PixMoCap
-from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
-from olmo.models.model import FSDPWrapStrategy
 from olmo.models.molmo.data_formatter import DataFormatter
 from olmo.models.molmo.model_preprocessor import MolmoPreprocessorConfig
+from olmo.data.pixmo_datasets import PixMoCap
+from launch_scripts.utils import DEBUG_MODEL, VISION_BACKBONES, LLMS
+from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 from olmo.models.molmo.molmo import MolmoConfig
-from olmo.nn.vision_backbone import MolmoVisionBackboneConfig, ImagePaddingEmbed
-from olmo.torch_util import get_world_size
+from olmo.models.model import FSDPWrapStrategy
 from olmo.train.optim import OptimizerConfig, OptimizerType, SchedulerConfig, SchedulerType
-from olmo.train.trainer_config import TrainConfig, WandbConfig, FSDPConfig, BatchDivisor, \
-    SpeedMonitorConfig
+from olmo.nn.vision_backbone import MolmoVisionBackboneConfig, ImagePaddingEmbed
 from scripts.train import run_trainer
 
-from olmo.util import (
-    add_cached_path_clients,
-    clean_opt,
-    prepare_cli_environment,
-)
-import torch.multiprocessing as mp
-import torch.distributed as dist
+from olmo.data.data_loader import DataLoaderConfig
+from olmo.train.trainer_config import BatchDivisor, SpeedMonitorConfig, \
+    CompilerConfig, TrainConfig, WandbConfig, FSDPConfig, FSDPPrecision
+from olmo.util import clean_opt, prepare_torchrun_environment
 
 
 log = logging.getLogger("train")
 
 
 if __name__ == "__main__":
-    try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError as e:
-        print(f"failed to set multiprocessing start method: {e}")
-    log.info(f"Multiprocessing start method set to '{mp.get_start_method()}'")
-
-    # Initialize process group.
-    dist.init_process_group(backend="nccl")
-    log.info("Process group initialized")
-
-    prepare_cli_environment()
-    log.info("CLI environment prepared")
-
-    add_cached_path_clients()
+    prepare_torchrun_environment()
 
     parser = argparse.ArgumentParser(prog="Train a captioner")
     parser.add_argument("llm", choices=["debug"] + list(LLMS.keys()))
-    parser.add_argument("--vision_backbone", choices=list(VISION_BACKBONES.keys()), default="openai")
+    parser.add_argument("--vision_backbone", choices=list(VISION_BACKBONES.keys()), default="siglip2")
     parser.add_argument("--global_batch_size", default=128, type=int)
     parser.add_argument("--n_eval_examples", default=2048, type=int)
     parser.add_argument("--device_eval_batch_size", default=4, type=int)
     parser.add_argument("--seq_len", default=2304, type=int)
+    parser.add_argument("--two_epochs", action="store_true")
     parser.add_argument("--dataset", default="pixmo_cap_with_transcripts")
     args, other_args = parser.parse_known_args()
 
@@ -63,8 +44,8 @@ if __name__ == "__main__":
     if debug:
         model_cfg = DEBUG_MODEL
         if args.llm == "debug-12crop":
-            model_cfg.max_crops = 12
-            model_cfg.crop_mode = "overlap-and-resize-c2"
+            model_cfg.mm_preprocessor.max_crops = 12
+            model_cfg.mm_preprocessor.crop_mode = "overlap-and-resize-c2"
         model_cfg.data_formatter.system_prompt = 'style_and_length'
 
         global_batch_size = 8
@@ -80,7 +61,6 @@ if __name__ == "__main__":
         n = len(PixMoCap("train", "captions"))
         duration = 4 * (n + global_batch_size - 1) // global_batch_size
         eval_interval = 1000
-        vit_layers = [-2, -9] if args.vision_backbone == "openai" else [-3, -9]
         vit_layers = [-2, -9] if args.vision_backbone == "openai" else [-3, -9]
 
         image_vit = VISION_BACKBONES[args.vision_backbone]
@@ -124,8 +104,8 @@ if __name__ == "__main__":
         ),
     )
 
+
     cfg = TrainConfig(
-        run_name="multitask_train",
         save_folder="debug_run" if debug else omegaconf.MISSING,
         seed=6198,
         dry_run=False,
@@ -136,6 +116,9 @@ if __name__ == "__main__":
             entity="${oc.env:WANDB_ENTITY}",
             log_interval=log_interval
         ),
+        compile=CompilerConfig(mode="default", dynamic=False),
+        fused_loss=False,
+        compile_loss=True,
         model=model_cfg,
         data=DataLoaderConfig(
             dataset=args.dataset,
@@ -165,7 +148,7 @@ if __name__ == "__main__":
             connector_eps=1e-6,
             vit_eps=1e-6,
             llm_eps=1e-6,
-            metrics_log_interval=20
+            metrics_log_interval=-1
         ),
         scheduler=SchedulerConfig(
             name=SchedulerType.multimodal,
@@ -175,12 +158,13 @@ if __name__ == "__main__":
             alpha_f=0.1,
             warmup_min_lr=0.0
         ),
-        fsdp=FSDPConfig(),
         load_path=None,
         initial_model_checkpoint=None,
         save_overwrite=debug,
         save_interval=4000,
+        allow_resume=True,
         save_num_checkpoints_to_keep=1,
+        save_final_unsharded_checkpoint=False,
         global_train_batch_size=global_batch_size,
         device_train_microbatch_size=4,
         time_limit=None,
@@ -193,26 +177,17 @@ if __name__ == "__main__":
         speed_monitor=SpeedMonitorConfig(window_size=20),
         softmax_auxiliary_loss=True,
         softmax_auxiliary_loss_scale=1e-4,
-        activation_checkpointing=True,
         eval_interval=eval_interval,
         evaluators=[
-            # Evaluate loss on data with and without the transcripts
             evaluator,
-            replace(
-                evaluator,
-                label="caption_val",
-                data=replace(
-                    evaluator.data,
-                    dataset="pixmo_cap"
-                )
-            )
+            replace(evaluator, data=replace(evaluator.data, dataset="pixmo_cap"), label="caption_val")
         ]
     )
 
     conf = OmegaConf.create(cfg)
-    if other_args:
-        overrides = [clean_opt(arg) for arg in other_args]
-        conf = OmegaConf.merge(conf, OmegaConf.from_dotlist(overrides))
+    conf.merge_with_dotlist([clean_opt(arg) for arg in other_args])
     cfg = cast(TrainConfig, OmegaConf.to_object(conf))
     run_trainer(cfg)
+
+
 

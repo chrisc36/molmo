@@ -602,7 +602,7 @@ class Trainer:
         elif self.cfg.batch_divisor == BatchDivisor.device_batch:
             batch_size_in_tokens = loss_masks.sum()
         else:
-            raise NotImplementedError(self.cfg.batch_divisor)
+            raise ValueError()
         del batch  # in case this helps reduce memory
 
         total_loss = torch.tensor(0.0, device=self.device)
@@ -624,6 +624,10 @@ class Trainer:
                 loss = ce_loss + z_loss
             else:
                 loss = ce_loss
+            if model_out.metrics is not None:
+                if "AuxLoss" in model_out.metrics:
+                    loss += model_out.metrics["AuxLoss"] / len(micro_batches)
+
             del model_out
 
             # Run backward pass.

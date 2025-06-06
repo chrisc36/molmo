@@ -6,7 +6,7 @@ from typing import cast
 
 from omegaconf import OmegaConf
 
-from launch_scripts.utils import get_evaluation
+from launch_scripts.utils import get_evaluation, get_hf_evaluation
 from olmo.train.trainer_config import FSDPConfig, FSDPPrecision
 from olmo.models.model import FSDPWrapStrategy
 from olmo.util import (
@@ -18,7 +18,11 @@ log = logging.getLogger(__name__)
 
 
 def main():
-    prepare_torchrun_environment()
+    # enable run on a single GPU
+    try:
+        prepare_torchrun_environment()
+    except:
+        log.warning("Failed to prepare torchrun environment, continuing anyway")
 
     parser = argparse.ArgumentParser(prog="Evaluate a model on downstream tasks")
     parser.add_argument("checkpoint",
@@ -38,13 +42,20 @@ def main():
                         help="Load with FSDP, can be used to avoid OOMs")
     parser.add_argument("--max_new_tokens", type=int, default=None,
                         help="Override max new tokens, otherwise use task-specific default")
+    parser.add_argument("--is_hf_model", action="store_true",
+                        help="Use this flag if the model is a huggingface model")
     parser.add_argument("--include_image", action="store_true",
                         help="Include image in the evaluation outputs")
+    parser.add_argument("--save_dir", type=str, default=None,
+                        help="Directory to save the evaluation results")
     args, other_args = parser.parse_known_args()
 
     if args.high_res:
-        args.max_crops = 36 if args.max_crops is None else args.max_crops
-        args.seq_len = 4096
+        if "siglip" in args.checkpoint:
+            args.max_crops = 24 if args.max_crops is None else args.max_crops
+        else:
+            args.max_crops = 36 if args.max_crops is None else args.max_crops
+        args.seq_len = 6144
         args.eval_name = f"{args.max_crops}crop"
 
     tasks = []
@@ -112,7 +123,10 @@ def main():
 
     inf_evaluators = []
     for task in tasks:
-        base_config = get_evaluation(name=task, seq_len=args.seq_len, max_examples=args.max_examples)
+        if args.is_hf_model:
+            base_config = get_hf_evaluation(name=task, seq_len=args.seq_len, max_examples=args.max_examples)
+        else:
+            base_config = get_evaluation(name=task, seq_len=args.seq_len, max_examples=args.max_examples)
         eval_config = DatasetEvaluatorConfig(
             label=base_config.label,
             data=replace(base_config.data, pad="to_max" if args.fsdp else None),
@@ -129,10 +143,15 @@ def main():
         )
         inf_evaluators.append(eval_config)
 
-    checkpoint_dir = "debug" if args.checkpoint == "debug" else select_checkpoint(args.checkpoint)
+    if args.is_hf_model:
+        checkpoint_dir = args.checkpoint
+    else:
+        checkpoint_dir = "debug" if args.checkpoint == "debug" else select_checkpoint(args.checkpoint)
 
     cfg = EvalConfig(
+        is_hf_model=args.is_hf_model,
         max_crops_override=args.max_crops,
+        model_max_length_override=args.seq_len,
         evaluations=inf_evaluators,
         load_path=checkpoint_dir,
         console_log_interval=10,
@@ -146,12 +165,24 @@ def main():
         ) if args.fsdp else None,
         skip_if_metrics_cached=not args.overwrite,
         include_image=args.include_image,
+        save_dir=args.save_dir,
     )
 
     config = OmegaConf.create(cfg)
     config.merge_with_dotlist([clean_opt(arg) for arg in other_args])
     cfg = cast(EvalConfig, OmegaConf.to_object(config))
-    cfg.build().run()
+    if args.is_hf_model:
+        data_formatter_cfg = dict(
+                    prompt_templates="uber_model",
+                    message_format="role",
+                    system_prompt="demo_or_style",
+                    always_start_with_space=True,
+                    is_hf_model=True,
+                    is_training=False,
+                )
+        cfg.build().run_hf(data_formater_cfg=data_formatter_cfg)
+    else:
+        cfg.build().run()
 
 
 if __name__ == "__main__":

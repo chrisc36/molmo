@@ -1,0 +1,31 @@
+#!/bin/bash
+
+torchrun --nproc-per-node 8 olmo/hf_train/finetune.py \
+    --deepspeed ./scripts/hf/deepspeed/zero2_offload.json \
+    --router_loss_scale 0.0 \
+    --model_name_or_path outputs/siglip2_molmo_o-7b-captioner \
+    --mixture 3.2-synthetic \
+    --inf_seq_len 1792 \
+    --vision_backbone siglip2 \
+    --bf16 True \
+    --output_dir outputs/siglip2_molmo_o-7b \
+    --max_steps 30000 \
+    --eval_batch_size 4 \
+    --inf_batch_size 4 \
+    --per_device_train_batch_size 32 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 1 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 2000 \
+    --save_total_limit 2 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --tf32 False \
+    --model_max_length 2304 \
+    --gradient_checkpointing True \
+    --dataloader_num_workers 4 \
+    --lazy_preprocess True \
+    --report_to wandb

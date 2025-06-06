@@ -19,11 +19,9 @@ from olmo.config import BaseConfig
 from olmo.data.data_loader import DataLoaderConfig
 from olmo.eval.inf_evaluator import InfDatasetEvaluator, EvaluatorConfig, \
     InfDatasetEvaluatorConfig
-from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig, LossDatasetEvaluator, \
-    SaveEvalDataConfig, is_histogram
+from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig, LossDatasetEvaluator
 from olmo.exceptions import OLMoCliError
 from olmo.io import file_exists, write_file, get_bytes_range, read_file
-from olmo.models.model_config import BaseModelConfig
 from olmo.models.molmo.model_preprocessor import MolmoPreprocessorConfig
 from olmo.nn.image_vit import VitConfig
 from olmo.nn.llm import LlmConfig
@@ -35,12 +33,15 @@ from olmo.torch_util import (
     get_global_rank,
     get_local_rank,
     peak_gpu_memory,
-    seed_all, get_world_size, )
+    seed_all, )
 from olmo.train.checkpointer import load_model_state
 from olmo.train.trainer_config import FSDPConfig
 from olmo.util import (
-    resource_path, log_metrics_to_console, prepare_torchrun_environment, clean_opt, flatten_lists,
+    resource_path, log_metrics_to_console, prepare_torchrun_environment, clean_opt,
 )
+from transformers import AutoModelForCausalLM, AutoProcessor, set_seed
+from olmo.hf_models import *
+from olmo.hf_models.processing import *
 
 log = logging.getLogger(__name__)
 
@@ -93,20 +94,12 @@ class DatasetEvaluatorConfig(BaseConfig):
     generative_evaluator: Optional[EvaluatorConfig] = None
     """Specifies how to compute metrics and save the predictions if doing a generative eval"""
 
-    save_data: Optional[SaveEvalDataConfig] = None
-    """
-    Save low-level inputs/outputs, these can be used to make visualizations, but can also occupy 
-    a lot of disk space
-    """
-
     @property
     def generative(self):
         return self.generative_evaluator is not None
 
     def build_evaluator(self, model_config, device, default_save_dir, console_log_interval, include_image=False):
         if self.generative:
-            if self.save_data:
-                raise NotImplementedError()
             cfg = InfDatasetEvaluatorConfig(
                 self.label, self.data, self.generative_evaluator,
                 max_new_tokens=self.max_new_tokens,
@@ -126,8 +119,29 @@ class DatasetEvaluatorConfig(BaseConfig):
                 max_examples=self.max_examples,
                 console_log_interval=console_log_interval
             )
-            return cfg.build_dataset_evaluator(model_config=model_config, device=device, save_data=self.save_data)
-
+            return cfg.build_dataset_evaluator(model_config=model_config, device=device)
+    
+    def build_hf_evaluator(self, processor, model_config, device, default_save_dir, console_log_interval):
+        if self.generative:
+            cfg = InfDatasetEvaluatorConfig(
+                self.label, self.data, self.generative_evaluator,
+                max_new_tokens=self.max_new_tokens,
+                device_batch_size=self.device_batch_size, # use 1 for HF models #TODO: fix padding issues for hf models
+                subset_num_batches=self.subset_num_batches,
+                max_examples=self.max_examples,
+                console_log_interval=console_log_interval
+            )
+            return cfg.build_hf_dataset_evaluator(
+                processor=processor, device=device, default_save_dir=default_save_dir)
+        else:
+            cfg = LossDatasetEvaluatorConfig(
+                self.label, self.data,
+                device_batch_size=self.device_batch_size,
+                subset_num_batches=self.subset_num_batches,
+                max_examples=self.max_examples,
+                console_log_interval=console_log_interval
+            )
+            return cfg.build_hf_dataset_evaluator(processor=processor, model_config=model_config, device=device)
 
 @dataclasses.dataclass
 class EvalConfig(BaseConfig):
@@ -139,12 +153,11 @@ class EvalConfig(BaseConfig):
     load_path: str = "./"
     """The directory to load the model from"""
 
-    model: Optional[BaseModelConfig] = None
-    """Model config to use, load the one in the `load_path`` if None"""
-
-    # FIXME can remove these override options since they can be overriden through `model_config`
     max_crops_override: Optional[int] = None
     """Override the max crops used in the model"""
+
+    model_max_length_override: Optional[int] = None
+    """Override the max length used in the model"""
 
     max_frames_override: Optional[int] = None
     """Override the max frames used in the model"""
@@ -159,7 +172,7 @@ class EvalConfig(BaseConfig):
     """Runs models with FSPD, needed for large models or large sequence lengths to reduce memory"""
 
     precision: Optional[str] = "fp32"
-    """Autocast precision"""
+    """Autocase precision"""
 
     pbar: bool = True
     """Whether to show a tqdm progress bar"""
@@ -179,6 +192,15 @@ class EvalConfig(BaseConfig):
     save_dir: Optional[str] = None
     """Where to save prediction, metrics, and visualizations"""
 
+    is_hf_model: Optional[bool] = False
+    """Whether the model is a HuggingFace transformers PreTrainedModel."""
+
+    hf_model_kwargs: Optional[dict] = None
+    """Additional kwargsfor initializing HuggingFace model."""
+
+    hf_inference_kwargs: Optional[dict] = None
+    """Additional kwargs to pass to the HuggingFace model during inference."""
+    
     include_image: bool = False
     """Include the image in the evaluation outputs"""
 
@@ -282,11 +304,8 @@ class ModelEvaluator:
             model.to_empty(device=device)
             model.reset_parameters()
         else:
-            if self.config.model:
-                model_cfg = self.config.model
-            else:
-                model_cfg_path = resource_path(cfg.load_path, "config.yaml")
-                model_cfg = MolmoConfig.load(model_cfg_path, key="model", validate_paths=False)
+            model_cfg_path = resource_path(cfg.load_path, "config.yaml")
+            model_cfg = MolmoConfig.load(model_cfg_path, key="model", validate_paths=False)
             with torch.device("meta"):
                 model: Molmo = model_cfg.build_model()
 
@@ -321,12 +340,114 @@ class ModelEvaluator:
         log.info(f"Peak GPU Memory (MB) before FSDP: {int(peak_gpu_memory() or 0)}")
         barrier()
         return model, device
+    
+    def initialize_and_load_hf_model(self, data_formater_cfg=None):
+        cfg = self.config
+        torch.cuda.set_device(f"cuda:{get_local_rank()}")
+
+        assert cfg.load_path != "debug", "Debugging model not supported for HF models"
+
+        if cfg.hf_model_kwargs is None:
+            try:
+                rank = get_global_rank()
+                kwargs = {
+                    "device_map": f"cuda:{rank}",  
+                    "torch_dtype": "bfloat16",  # Use 'float16' if needed
+                }
+            except:
+                kwargs = {
+                    "device_map": "auto",  
+                    "torch_dtype": "bfloat16",  # Use 'float16' if needed
+                }
+        else:
+            kwargs = cfg.hf_model_kwargs
+
+        if "molmo" in cfg.load_path.lower():
+            if "olmoe" in cfg.load_path.lower():
+                # Load the model
+                model = MolmoeForCausalLM.from_pretrained(
+                    cfg.load_path,
+                    **kwargs
+                    
+                )
+            elif "olmo-d" in cfg.load_path.lower():
+                # Load the model
+                model = MolmoDForCausalLM.from_pretrained(
+                    cfg.load_path,
+                    **kwargs
+                )
+            elif "olmo" in cfg.load_path.lower():
+                # Load the model
+                model = MolmoOForCausalLM.from_pretrained(
+                    cfg.load_path,
+                    **kwargs
+                )
+            else:
+                raise ValueError(f"Unknown model type in {cfg.load_path}")
+            processor = MolmoProcessor.from_pretrained(
+                cfg.load_path,
+                **kwargs
+                )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.load_path,
+                trust_remote_code=True,
+                **kwargs
+            )
+            processor = AutoProcessor.from_pretrained(
+                cfg.load_path,
+                trust_remote_code=True,
+                **kwargs
+            )
+            
+        processor.tokenizer.padding_side = "left"
+        if data_formater_cfg is not None:
+            processor.data_formatter_cfg = data_formater_cfg
+        from olmo.hf_models.processing.processing_molmo import EXTRA_TOKENS, DEFAULT_IMAGE_PATCH_TOKEN
+        ids = processor.tokenizer.encode("".join(EXTRA_TOKENS), add_special_tokens=False)
+        if len(ids) != len(EXTRA_TOKENS):
+            processor.tokenizer.add_tokens(list(EXTRA_TOKENS))
+            ids = processor.tokenizer.encode("".join(EXTRA_TOKENS), add_special_tokens=False)
+        assert len(ids) == len(EXTRA_TOKENS), f"Tokenizer did not add all special tokens. Expected {len(EXTRA_TOKENS)} but got {len(ids)}"
+        model.config.image_patch_id = processor.special_token_ids[DEFAULT_IMAGE_PATCH_TOKEN]
+        model.model._image_patch_id = processor.special_token_ids[DEFAULT_IMAGE_PATCH_TOKEN]
+
+        device = model.device
+
+        if self.config.max_crops_override:
+            logging.info(f"Overriding max crops from {processor.image_processor.max_crops} to {self.config.max_crops_override}")
+            processor.image_processor.max_crops = self.config.max_crops_override
+
+        if self.config.model_max_length_override:
+            logging.info(f"Overriding max length from {processor.tokenizer.model_max_length} to {self.config.model_max_length_override}")
+            processor.tokenizer.model_max_length = self.config.model_max_length_override
+
+        if self.config.max_frames_override:
+            logging.info(f"Overriding max frames not supported for HF models, skipping override")
+        
+        if self.config.candidate_sampling_fps_override:
+            logging.info(f"Overriding candidate sampling fps not supported for HF models, skipping override")
+
+        # Just in case the model is doing randomization even during eval
+        set_seed(cfg.seed)
+
+        # dtype = model.dtype
+        # log.info(f"Model weight dtype: {dtype}")
+        # log.info(f"Total number of parameters: {sum(p.numel() for p in model.parameters()):,d}")
+        # non_embedding_params = sum(p.numel() for name, p in model.named_parameters() if "embed" not in name)
+        # log.info(f"Number of non-embedding parameters: {non_embedding_params:,d}")
+        # log.info(f"Peak GPU Memory (MB) before FSDP: {int(peak_gpu_memory() or 0)}")
+        # barrier()
+        return model, processor, device
 
     def run(self):
+        if self.config.is_hf_model:
+            return self.run_hf()
+        
         config = self.config
         assert len(config.evaluations) > 0
 
-        # Load any metrics that were cached
+        # # Load any metrics that were cached
         cfg_to_metrics = {}
         for cfg in config.evaluations:
             if self.config.skip_if_metrics_cached:
@@ -383,27 +504,111 @@ class ModelEvaluator:
                 metrics = evaluator.run(
                     model, device,
                     autocast_precision=self.config.autocast_precision,
-                    pbar=self.config.pbar,
+                    pbar=self.config.pbar
                 )
-            if evaluation.save_data:
-                metrics, saved_data = metrics
-                if get_global_rank() == 0:
-                    out = [None for _ in range(get_world_size())]
-                    dist.gather_object(saved_data, out)
-                    selection_data = flatten_lists(out)
-                    if save_dir is not None:
-                        logging.info(f"Saving eval data to {save_dir}")
-                        os.makedirs(save_dir, exist_ok=True)
-                        data = pickle.dumps(selection_data)
-                        write_file(save_dir, "eval_data.pkl", data, True)
-                else:
-                    dist.gather_object(saved_data)
-                    selection_data = None
 
             # Post-process the metrics by saving the wandb.Html outputs to disk
             if save_dir and get_global_rank() == 0:
                 for k, v in list(metrics.items()):
-                    if is_histogram(k):
+                    if k in ["HighResSelection", "HighResVals"]:
+                        # FIXME Ideally we would save the histogram as a PNG
+                        del metrics[k]
+                        continue
+                    if isinstance(v, wandb.Html):
+                        filename = f"{evaluation.label}-{k}.html"
+                        write_file(save_dir, filename, v.html, True)
+                        if save_dir.startswith("gs://"):
+                            metrics[k] = get_gcs_url(join(save_dir, filename))
+                        else:
+                            metrics[k] = join(save_dir, filename)
+
+            to_print = {k: v for k, v in metrics.items() if isinstance(v, (int, float, str))}
+            if metrics_file and get_global_rank() == 0:
+                to_save = dict(
+                    metrics=metrics,
+                    beaker_experiment_id=os.environ.get("BEAKER_EXPERIMENT_ID"),
+                    date=datetime.now().strftime("%m/%d/%Y, %H:%M"),
+                    eval_config=dataclasses.asdict(evaluation),
+                )
+                write_file(save_dir, "metrics.json", json.dumps(to_save, indent=2), True)
+            log_metrics_to_console(evaluation.label, to_print)
+            cfg_to_metrics[evaluation.label] = metrics
+
+        all_metrics = {}
+        for name, metrics in cfg_to_metrics.items():
+            all_metrics.update({f"{name}/{k}": v for k, v in metrics.items()})
+
+        # if len(config.evaluations) > 1:   # print aggregated metrics if doing multiple evaluations
+        to_print = {k: v for k, v in all_metrics.items() if isinstance(v, (int, float, str))}
+        log_metrics_to_console("all-metrics", to_print)
+        return all_metrics
+
+    def run_hf(self, data_formater_cfg=None):
+        config = self.config
+        assert len(config.evaluations) > 0
+
+        # # Load any metrics that were cached
+        cfg_to_metrics = {}
+        for cfg in config.evaluations:
+            if self.config.skip_if_metrics_cached:
+                metric_file = self.get_metric_file(cfg)
+                if metric_file and file_exists(metric_file):
+                    logging.info(f"Loading pre-computed metrics for {cfg.label} from {metric_file}")
+                    if get_global_rank() == 0:
+                        cfg_to_metrics[cfg.label] = json.loads(read_file(metric_file))["metrics"]
+                    else:
+                        # Still set with a empty dict to mark that this eval can can be skipped
+                        cfg_to_metrics[cfg.label] = {}
+
+        # Possibly return early if everything was cached
+        if all(x.label in cfg_to_metrics for x in config.evaluations):
+            logging.info("All metrics cached, checkpoint will not be loaded")
+            all_metrics = {}
+            for name, metrics in cfg_to_metrics.items():
+                all_metrics.update({f"{name}/{k}": v for k, v in metrics.items()})
+            to_print = {k: v for k, v in all_metrics.items() if isinstance(v, (int, float, str))}
+            log_metrics_to_console("all-metrics", to_print)
+            return all_metrics
+
+        model, processor, device = self.initialize_and_load_hf_model(data_formater_cfg=data_formater_cfg)
+
+        all_metrics = {}
+        for eval_ix, evaluation in enumerate(config.evaluations):
+            if evaluation.label in cfg_to_metrics:
+                continue
+
+            if len(config.evaluations) == 1:
+                logging.info(f"Starting inference {evaluation.label}")
+            else:
+                logging.info(f"Starting inference {evaluation.label} ({eval_ix+1}/{len(config.evaluations)})")
+
+            metrics_file = self.get_metric_file(evaluation)
+            if metrics_file and file_exists(metrics_file):
+                logging.warning(f"{metrics_file} already exists! File will be overwritten")
+
+            save_dir = self.get_save_dir(evaluation)
+
+            if evaluation.generative:
+                evaluator: InfDatasetEvaluator = evaluation.build_hf_evaluator(
+                    processor, model.config, device, save_dir, self.config.console_log_interval)
+                metrics = evaluator.run_hf(
+                    model, processor, device,
+                    autocast_precision=self.config.autocast_precision,
+                    pbar=self.config.pbar,
+                )
+            else:
+                evaluator: LossDatasetEvaluator = evaluation.build_hf_evaluator(
+                     processor, model.config, device, save_dir, self.config.console_log_interval)
+                metrics = evaluator.run_hf(
+                    model, processor, device,
+                    autocast_precision=self.config.autocast_precision,
+                    pbar=self.config.pbar
+                )
+
+            # Post-process the metrics by saving the wandb.Html outputs to disk
+            if save_dir and get_global_rank() == 0:
+                for k, v in list(metrics.items()):
+                    if k in ["HighResSelection", "HighResVals"]:
                         # FIXME Ideally we would save the histogram as a PNG
                         del metrics[k]
                         continue

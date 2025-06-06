@@ -1,6 +1,5 @@
 import dataclasses
 import math
-import re
 from typing import Optional, Any, List, Union, Dict
 
 import numpy as np
@@ -27,7 +26,6 @@ class InterleavedTextPreprocessor:
     max_text_tokens: Optional[int] = None
     max_sequence_length: Optional[int] = None
     last_message_loss_only: bool = False
-    max_answer_len: int = None
 
     def tokenize_message(self, message_list: List[str], bos=True, add_last_eos=True):
         if bos:
@@ -43,9 +41,6 @@ class InterleavedTextPreprocessor:
             if is_model and (add_last_eos or msg_ix != len(message_list) - 1):
                 message_ids.append(self.tokenizer.eos_token_id)
 
-            if is_model and self.max_answer_len:
-                message_ids = message_ids[:self.max_answer_len]
-
             has_loss = is_model and (
                 not self.last_message_loss_only or (msg_ix == (len(message_list) - 1)))
             loss_mask += [has_loss] * len(message_ids)
@@ -54,77 +49,75 @@ class InterleavedTextPreprocessor:
         is_prompt = text_token_ids == self.tokenizer.image_prompt_token_id
         return text_token_ids, np.array(loss_mask, dtype=np.float32)
 
-    def tokenize_message_list(
-        self,
-        message_list: Union[List[str], List[List[str]]],
-        n_mm_tokens: int,
-        num_images: int = 1,
-    ):
-        """Handle multi-annotation data where we have many annotations for one multi-modal input"""
+    def tokenize_message_list(self, message_list: Union[List[str], List[List[str]]], n_mm_tokens):
         assert len(message_list) > 0, "Given empty messages"
-        # Multi-annotation data where we have many annotations for one multi-modal input
-        before_ids = []
-        after_ids = []
-        before_losses = []
-        after_losses = []
-        before_subsegments = []
-        after_subsegments = []
-        n_tokens = 0
-        for message_set_ix, message_tuple in enumerate(message_list):
-            add_bos = message_set_ix == 0
-            text_ids, text_loss = self.tokenize_message(
-                message_tuple, bos=add_bos, add_last_eos=False)
-            is_prompt = text_ids == self.tokenizer.image_prompt_token_id
-            n_prompts = is_prompt.sum()
-            if n_prompts == 1:
-                image_idx = np.argmax(is_prompt)
-                s, e = image_idx, image_idx+1
-            elif n_prompts == 0 and add_bos:
-                s, e = 1, 1
-            elif n_prompts == 0:
-                s, e = 0, 0
-            else:
-                raise NotImplementedError("Multi-message with multi images")
+        if isinstance(message_list[0], str):
+            text_token_ids, text_loss_masks = self.tokenize_message(message_list)
+            return text_token_ids, text_loss_masks, None
+        else:
+            # Multi-annotation data where we have many annotations for one multi-modal input
+            before_ids = []
+            after_ids = []
+            before_losses = []
+            after_losses = []
+            before_subsegments = []
+            after_subsegments = []
+            n_tokens = 0
+            for message_set_ix, message_tuple in enumerate(message_list):
+                add_bos = message_set_ix == 0
+                text_ids, text_loss = self.tokenize_message(
+                    message_tuple, bos=add_bos, add_last_eos=False)
+                is_prompt = text_ids == self.tokenizer.image_prompt_token_id
+                n_prompts = is_prompt.sum()
+                if n_prompts == 1:
+                    image_idx = np.argmax(is_prompt)
+                    s, e = image_idx, image_idx+1
+                elif n_prompts == 0 and add_bos:
+                    s, e = 1, 1
+                elif n_prompts == 0:
+                    s, e = 0, 0
+                else:
+                    raise NotImplementedError("Multi-message with multi images")
 
-            if text_loss[e] != 0:
-                raise ValueError("Must have a non-loss token after MM data")
-            if self.max_sequence_length and message_set_ix != 0:
-                if (n_mm_tokens + n_tokens + np.argmax(text_loss != 0)) >= self.max_sequence_length:
-                    # This example would get no loss tokens anyway
+                if text_loss[e] != 0:
+                    raise ValueError("Must have a non-loss token after MM data")
+                if self.max_sequence_length and message_set_ix != 0:
+                    if (n_mm_tokens + n_tokens + np.argmax(text_loss != 0)) >= self.max_sequence_length:
+                        # This example would get no loss tokens anyway
+                        break
+                n_tokens += len(text_ids)
+                before_ids.append(text_ids[:s])
+                after_ids.append(text_ids[e:])
+                before_losses.append(text_loss[:s])
+                after_losses.append(text_loss[e:])
+                before_subsegments.append(np.full(s, ATTEND_ALL_SUBSEGMENT_ID, dtype=np.int32))
+                after_subsegments.append(np.full(len(text_ids[e:]), message_set_ix, dtype=np.int32))
+                if self.max_text_tokens and (n_tokens >= self.max_text_tokens):
                     break
-            n_tokens += len(text_ids)
-            before_ids.append(text_ids[:s])
-            after_ids.append(text_ids[e:])
-            before_losses.append(text_loss[:s])
-            after_losses.append(text_loss[e:])
-            before_subsegments.append(np.full(s, ATTEND_ALL_SUBSEGMENT_ID, dtype=np.int32))
-            after_subsegments.append(np.full(len(text_ids[e:]), message_set_ix, dtype=np.int32))
-            if self.max_text_tokens and (n_tokens >= self.max_text_tokens):
-                break
 
-        text_token_ids = np.concatenate([
-            np.concatenate(before_ids),
-            [self.tokenizer.image_prompt_token_id] * num_images,
-            np.concatenate(after_ids),
-            [self.tokenizer.eos_token_id],
-        ])
-        text_subsegments = np.concatenate([
-            np.concatenate(before_subsegments),
-            [ATTEND_ALL_SUBSEGMENT_ID] * num_images,
-            np.concatenate(after_subsegments),
-            after_subsegments[-1][-1:]  # for EOS
-        ])
-        text_loss_masks = np.concatenate([
-            np.concatenate(before_losses),
-            [0] * num_images,
-            np.concatenate(after_losses),
-            [0]  # for EOS
-        ])
-        if self.loss_token_weighting == "root_subsegments":
-            text_loss_masks *= math.sqrt(1/len(before_ids))
-        elif self.loss_token_weighting is not None:
-            raise NotImplementedError(self.loss_token_weighting)
-        return text_token_ids, text_loss_masks, text_subsegments
+            text_token_ids = np.concatenate([
+                np.concatenate(before_ids),
+                [self.tokenizer.image_prompt_token_id],
+                np.concatenate(after_ids),
+                [self.tokenizer.eos_token_id],
+            ])
+            text_subsegments = np.concatenate([
+                np.concatenate(before_subsegments),
+                [ATTEND_ALL_SUBSEGMENT_ID],
+                np.concatenate(after_subsegments),
+                after_subsegments[-1][-1:]  # for EOS
+            ])
+            text_loss_masks = np.concatenate([
+                np.concatenate(before_losses),
+                [0],
+                np.concatenate(after_losses),
+                [0]  # for EOS
+            ])
+            if self.loss_token_weighting == "root_subsegments":
+                text_loss_masks *= math.sqrt(1/len(before_ids))
+            elif self.loss_token_weighting is not None:
+                raise NotImplementedError(self.loss_token_weighting)
+            return text_token_ids, text_loss_masks, text_subsegments
 
     def tokenize_and_interleave(
         self,
@@ -146,16 +139,7 @@ class InterleavedTextPreprocessor:
         tokens before the MM tokens will be allowed, but attending between tokens after the MM
         tokens will not.
         """
-        if isinstance(message_list[0], list) and len(message_list) == 1:
-            message_list = message_list[0]
-        if isinstance(message_list[0], str):
-            text_token_ids, text_loss_masks = self.tokenize_message(message_list)
-            text_subsegments = None
-            for_inference = len(message_list) % 2 == 1
-        else:
-            text_token_ids, text_loss_masks, text_subsegments = self.tokenize_message_list(
-                message_list, sum(len(x) for x in multi_model_tokens), 0 if multi_model_tokens is None else len(multi_model_tokens))
-            for_inference = False
+        text_token_ids, text_loss_masks, text_subsegments = self.tokenize_message_list(message_list, sum(len(x) for x in multi_model_tokens))
 
         mm_idx = np.argwhere(text_token_ids == self.tokenizer.image_prompt_token_id)
         if len(mm_idx) == 0:
@@ -208,30 +192,6 @@ class InterleavedTextPreprocessor:
         else:
             mm_position_ids = [np.arange(0, sum(len(x) for x in mm_tokens))]
 
-        sample_high_res = getattr(self, "sample_high_res", None)
-        is_reconstruct = sample_high_res is not None and sample_high_res.startswith("reconstruct")
-        if is_reconstruct:
-            k = int(re.fullmatch("reconstruct([0-9]+).*", sample_high_res).group(1))
-            start_pos_id = mm_position_ids[-1][0]
-            query_pos = np.full([k], fill_value=start_pos_id, dtype=np.int32)
-            query_loss_mask = np.zeros([k])
-            query_tokens = np.full([k], fill_value=self.tokenizer.image_query_token_id, dtype=np.int32)
-            assert mm_subsegments is None
-            mm_position_ids = mm_position_ids[:2] + [query_pos] + mm_position_ids[2:]
-            mm_loss_masks = mm_loss_masks[:2] + [query_loss_mask] + mm_loss_masks[2:]
-            mm_subsegments = [
-                np.zeros_like(mm_tokens[0])+ATTEND_ALL_SUBSEGMENT_ID,
-                np.zeros_like(mm_tokens[1])+ATTEND_ALL_SUBSEGMENT_ID,
-                np.arange(0, k),
-                np.full(len(mm_tokens[2]), fill_value=k, dtype=np.int32),
-            ]
-            mm_tokens = mm_tokens[:2] + [query_tokens] + mm_tokens[2:]
-            if sample_high_res.endswith("_only"):
-                mm_position_ids[-1] = mm_position_ids[-1][:2]
-                mm_loss_masks[-1] = np.array([1.0, 1.0])
-                mm_tokens[-1] = np.array([10, 10])
-                mm_subsegments[-1] = mm_subsegments[-1][:2]
-
         mm_tokens = np.concatenate(mm_tokens)
         mm_loss_masks = np.concatenate(mm_loss_masks)
         mm_position_ids = np.concatenate(mm_position_ids)
@@ -248,19 +208,18 @@ class InterleavedTextPreprocessor:
                 # The targets for subsegments in the middle need to end with EOS,
                 # currently they end with whatever starts the next segment
                 mm_subsegments = mm_subsegments[:-1]
-                if not is_reconstruct:
-                    target_tokens = np.copy(target_tokens)
-                    for i in range(len(message_list)):
-                        subsegment_mask = mm_subsegments == i
-                        if not np.any(mm_subsegments == i):
-                            assert (self.max_text_tokens or self.max_sequence_length) and i != 0
-                            # Message skipped due hitting `self.max_text_tokens`
-                            break
-                        segment_end = np.argwhere(mm_subsegments == i)[-1, 0]
-                        target_tokens[segment_end] = self.tokenizer.eos_token_id
-                        assert mm_subsegments[segment_end-1] == i
-                        assert mm_loss_masks[segment_end-1] != 0
-                        mm_loss_masks[segment_end] = mm_loss_masks[segment_end-1]
+                target_tokens = np.copy(target_tokens)
+                for i in range(len(message_list)):
+                    subsegment_mask = mm_subsegments == i
+                    if not np.any(mm_subsegments == i):
+                        assert (self.max_text_tokens or self.max_sequence_length) and i != 0
+                        # Message skipped due hitting `self.max_text_tokens`
+                        break
+                    segment_end = np.argwhere(mm_subsegments == i)[-1, 0]
+                    target_tokens[segment_end] = self.tokenizer.eos_token_id
+                    assert mm_subsegments[segment_end-1] == i
+                    assert mm_loss_masks[segment_end-1] != 0
+                    mm_loss_masks[segment_end] = mm_loss_masks[segment_end-1]
 
             if mm_loss_masks[-1] == 0:
                 raise RuntimeError("EOS should not be masked")

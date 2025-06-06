@@ -15,6 +15,7 @@ from tqdm import tqdm
 from .evaluators import (
     HtmlTable, CountEval, PointCountEval, PointingEval, ClockEval, VqaEval,
     SavePredictions, AndroidControlEval, MathVistaEval, PointingEval,
+    TempCompassEval, VideoMMEEval, MLVUGenEval, LongVideoBenchEval
 )
 from ..config import BaseConfig
 from ..data.data_loader import DataLoaderConfig
@@ -24,6 +25,8 @@ from ..torch_util import (
     move_to_device,
 )
 from ..util import flatten_list
+
+from transformers import GenerationConfig
 
 __all__ = ["InfEvaluator", "EvaluatorConfig", "InfDatasetEvaluator", "InfDatasetEvaluatorConfig"]
 
@@ -56,11 +59,18 @@ class InfEvaluator:
                 # have enough rows to show even if each device only eval-ed a few examples
                 if get_global_rank() == 0:
                     all_predictions = [None]*get_world_size()
-                    dist.gather_object(v, all_predictions)
+                    if dist.is_initialized() and dist.get_world_size() > 1:
+                        dist.gather_object(v, all_predictions)
+                    else:
+                        all_predictions = [v]  # Just store it directly for single GPU
                     all_rows = flatten_list([x.rows for x in all_predictions])
                     resolved_metrics[k] = wandb.Html(HtmlTable(all_rows).get_html())
                 else:
-                    dist.gather_object(v, None)
+                    # enable run on a single GPU
+                    if dist.is_initialized() and dist.get_world_size() > 1:
+                        dist.gather_object(v, None)
+                    else:
+                        v = None
             else:
                 raise ValueError(f"Metric {v} not understood")
 
@@ -71,6 +81,16 @@ class InfEvaluator:
                 counting_scores = {k: resolved_metrics[k] for
                                    k in list(resolved_metrics.keys()) if k.startswith("correct_")}
                 resolved_metrics["per_category_average"] = np.mean(list(counting_scores.values()))
+            elif isinstance(metric, MLVUGenEval):
+                # MLVU has a macro-score that should be computed once we have
+                # scores from all devices
+                mlvu_sub_scene_scores = {k: resolved_metrics[k] for
+                                         k in list(resolved_metrics.keys()) if k.startswith("sub_scene_")}
+                resolved_metrics["sub_scene_total"] = np.sum(list(mlvu_sub_scene_scores.values()))
+                mlvu_summary_scores = {k: resolved_metrics[k] for
+                                      k in list(resolved_metrics.keys()) if k.startswith("summary_")}
+                resolved_metrics["summary_total"] = np.sum(list(mlvu_summary_scores.values()))
+                resolved_metrics["mlvu_gen_total"] = np.mean([resolved_metrics["sub_scene_total"], resolved_metrics["summary_total"]])
         return resolved_metrics
 
 
@@ -101,6 +121,14 @@ class EvaluatorConfig(BaseConfig):
     clock_eval: bool = False
     clock_bench_eval: bool = False # Clock reading benchmark, coco/openimg/movies
     math_vista_eval: bool = False
+    temp_compass_eval: str = ''
+    """TempCompass tasks to run evaluation on, either one of the tasks or 'all'"""
+    temp_compass_disable_api: bool = False
+    """Whether not to use ChatGPT evaluation for TempCompass"""
+    video_mme_eval: str = ''
+    """VideoMME tasks to run evaluation on, either one of the tasks or 'all'"""
+    mlvu_gen_eval: bool = False
+    long_video_bench_eval: bool = False
 
     def build(self, default_save_dir=None) -> InfEvaluator:
         evaluators = []
@@ -131,6 +159,14 @@ class EvaluatorConfig(BaseConfig):
             evaluators.append(CountEval(self.num_wandb_examples))
         elif self.android_eval:
             evaluators.append(AndroidControlEval(self.num_wandb_examples))
+        elif self.temp_compass_eval:
+            evaluators.append(TempCompassEval(self.temp_compass_eval, self.temp_compass_disable_api, self.num_wandb_examples))
+        elif self.video_mme_eval:
+            evaluators.append(VideoMMEEval(self.video_mme_eval, self.num_wandb_examples))
+        elif self.mlvu_gen_eval:
+            evaluators.append(MLVUGenEval(self.num_wandb_examples))
+        elif self.long_video_bench_eval:
+            evaluators.append(LongVideoBenchEval(self.num_wandb_examples))
         if self.pointing_eval:
             evaluators.append(PointingEval(self.num_wandb_examples))
         else:
@@ -162,7 +198,7 @@ class InfDatasetEvaluator:
         predictions = defaultdict(list)
         done_init = False
         pbar = pbar and get_global_rank() == 0
-        for eval_step, batch in enumerate(tqdm(eval_it, total=total_steps, ncols=100, disable=not pbar)):
+        for eval_step, batch in enumerate(tqdm(eval_it, total=total_steps, ncols=100)):
             if "metadata" in batch:
                 batch_metadata = batch.pop("metadata")
             else:
@@ -177,7 +213,7 @@ class InfDatasetEvaluator:
                         else:
                             converted[k] = v[i].tolist()
                     batch_metadata.append(converted)
-
+            
             batch_inference = move_to_device(batch, device)
             with torch.inference_mode():
                 with torch.autocast("cuda", enabled=True, dtype=autocast_precision):
@@ -205,6 +241,76 @@ class InfDatasetEvaluator:
 
         tokenizer = model.config.build_tokenizer()
         metrics = self.evaluator(predictions, all_metadata, tokenizer, device)
+        return metrics
+    
+    def run_hf(self, model, processor, device, autocast_precision, pbar=True):
+        eval_dataloader = self.dataloader
+        eval_it = iter(eval_dataloader)
+        n_steps = self.n_steps
+        if n_steps is not None and 0 <= n_steps < len(self.dataloader):
+            eval_it = itertools.islice(eval_it, 0, n_steps)
+            total_steps = n_steps
+        else:
+            total_steps = len(eval_dataloader)
+
+        all_metadata = []
+        predictions = defaultdict(list)
+        done_init = False
+        pbar = pbar and get_global_rank() == 0
+        for eval_step, batch in enumerate(tqdm(eval_it, total=total_steps, ncols=100)):
+            batch_metadata = batch.pop("metadata")
+            if not isinstance(batch_metadata, list):
+                batch_metadata = [batch_metadata]
+            
+            inputs = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor) or "image" in k}
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    if inputs["input_ids"].ndim == 1:
+                        inputs[k] = v.unsqueeze(0).to(model.device)
+                    else:
+                        inputs[k] = v.to(model.device)
+        
+            with torch.autocast("cuda", enabled=True, dtype=autocast_precision):
+                output = model.generate_from_batch(
+                    inputs,
+                    generation_config=GenerationConfig(max_new_tokens=self.max_new_tokens, stop_strings="<|endoftext|>"),
+                    tokenizer=processor.tokenizer
+                )
+            
+            preds = []
+            input_ids = []
+            for idx in range(output.shape[0]):
+                pred_org = output[idx].detach().cpu().numpy()
+                if pred_org.shape[0] > inputs["input_ids"][idx].shape[0]:
+                    pred_org = pred_org[inputs['input_ids'][idx].shape[0]:]
+
+                while processor.tokenizer.eos_token_id in pred_org:
+                    eos_idxs = np.where(pred_org == processor.tokenizer.eos_token_id)[0]
+                    if eos_idxs[-1] == 0:
+                        pred_org = pred_org[1:]
+                    else:
+                        pred_org = pred_org[:eos_idxs[-1]]
+                pred = pred_org
+                end_token = processor.tokenizer.decode([pred[-1]])
+                if "<|" in end_token and "|>" in end_token:
+                    pred = pred[:-1]
+
+                preds.append(pred)
+                input_ids.append(inputs["input_ids"][idx].detach().cpu().numpy().astype(np.int64))
+
+            pred = {
+                "predictions": preds, # beam size of 1
+                "prompts": input_ids,
+            }
+
+            for idx, metadata in enumerate(batch_metadata):
+                if metadata.get("valid", True):
+                    all_metadata += [metadata]
+                    for k, v in pred.items():
+                        predictions[k].append(v[idx])
+
+        metrics = self.evaluator(predictions, all_metadata, processor.tokenizer, device)
+        
         return metrics
 
 
@@ -267,6 +373,37 @@ class InfDatasetEvaluatorConfig(BaseConfig):
             num_batches = self.subset_num_batches
         else:
             num_batches = len(eval_loader)
+
+        return InfDatasetEvaluator(
+            label=self.label,
+            dataloader=eval_loader,
+            evaluator=self.evaluator.build(default_save_dir),
+            n_steps=max_steps,
+            max_new_tokens=self.max_new_tokens,
+            console_log_interval=self.console_log_interval
+        )
+    
+    def build_hf_dataset_evaluator(
+        self,
+        processor,
+        default_save_dir,
+        device,
+    ) -> InfDatasetEvaluator:
+        global_batch_size = self.device_batch_size * get_world_size()
+        if self.max_examples and self.max_examples > 0:
+            max_steps = max(self.max_examples // global_batch_size, 1)
+        elif self.subset_num_batches:
+            max_steps = self.subset_num_batches
+        else:
+            max_steps = None
+
+        eval_loader = self.data.build_eval_dataloader(
+            self.device_batch_size,
+            preprocessor=processor,
+            for_inference=True,
+            pad_batches=True,
+            max_steps_for_padding=max_steps,
+        )
 
         return InfDatasetEvaluator(
             label=self.label,

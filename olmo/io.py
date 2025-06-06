@@ -210,9 +210,16 @@ def write_file(dir: PathOrStr, fname: str, contents: Union[str, bytes, Callable]
     mode = "wt" if isinstance(contents, str) else "wb"
     tmp_path = None
     try:
-        tmp_file = tempfile.NamedTemporaryFile(
-            mode=mode, delete=False, dir=None if is_url(dir) else dir
-        )
+        kwargs = {
+            "mode": mode,
+            "delete": False,
+            "dir": None if is_url(dir) else dir,
+        }
+        if 'b' not in mode:
+            kwargs["encoding"] = "utf-8"
+
+        tmp_file = tempfile.NamedTemporaryFile(**kwargs)
+
         tmp_path = Path(tmp_file.name)
         if isinstance(contents, (str, bytes)):
             tmp_file.write(contents)

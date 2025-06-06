@@ -14,6 +14,12 @@ requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "absl-py",
+    "timm",
+    "xformers",
+    "peft",
+    "tiktoken",
+    "blobfile",
+    "bitsandbytes",
     "cached_property",
     "fiddle >= 0.2.5",
     "numpy",
@@ -26,7 +32,7 @@ dependencies = [
     "tokenizers",
     "packaging",
     "cached_path>=1.6.4",
-    "transformers>=v4.37.1",
+    "transformers==4.43.1",
     "datasets",
     "huggingface_hub",
     "sentencepiece",
@@ -53,7 +59,8 @@ dev = [
 ]
 train = [
     "wandb",
-    "beaker-gantry",
+    "beaker-py==1.36.2",
+    "beaker-gantry==1.17.0",
     "click",
     "torchmetrics",
     "smashed[remote]>=0.21.1",

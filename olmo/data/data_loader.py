@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Union, Tuple
+from typing import Optional, Dict, List
 
 import numpy as np
 import omegaconf
 from torch.utils.data import DataLoader, DistributedSampler
 
 from olmo.config import BaseConfig
-from olmo.data.dataset import DeterministicDataset, Dataset
+from olmo.data.dataset import DeterministicDataset
 from olmo.data.get_dataset import get_dataset_by_name
 from olmo.data.iterable_dataset_mixture import IterableDatasetMixture
 from olmo.models.molmo.molmo import MolmoConfig
@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 class RootSizeMixture(BaseConfig):
     rate: float
     mixture: Dict[str, Optional[float]]
+
 
 @dataclass
 class DataLoaderConfig(BaseConfig):
@@ -48,17 +49,8 @@ class DataLoaderConfig(BaseConfig):
     sequence_length: Optional[int] = None
     """Max sequence length to truncate examples to in the Collator"""
 
-    max_text_seq_len: Optional[int] = None
-    """Max sequence length excluding MM tokens
-    
-    If set, the sequence_length is computed as `max_text_seq_len` + the max length of the MM tokens
-    """
-
     shuffle: Optional[bool] = True
     """Should the data be shuffled"""
-
-    start_index: int = 0
-    """Example index to start at"""
 
     # DataLoader args
     num_workers: int = 0
@@ -97,13 +89,7 @@ class DataLoaderConfig(BaseConfig):
                 # exactly the same number of batches
                 n_pad = (n_steps*global_batch_size) - len(dataset)
 
-        if self.pad is None:
-            max_seq_len = None
-        elif self.max_text_seq_len:
-            max_seq_len = self.max_text_seq_len + model_config.mm_preprocessor.get_max_mm_tokens(model_config.vision_backbone)
-            max_seq_len = ((max_seq_len + 8 - 1) // 8) * 8
-        else:
-            max_seq_len = self.sequence_length
+        max_seq_len = self.sequence_length if self.pad else None
         preprocessor = model_config.build_preprocessor(
             for_inference=for_inference, is_training=False, include_image=include_image, max_seq_len=max_seq_len)
         dataset = DeterministicDataset(
@@ -120,11 +106,12 @@ class DataLoaderConfig(BaseConfig):
             rank=get_global_rank(),
             seed=self.seed,
         )
+
         return DataLoader(
             dataset,
             batch_size=batch_size,
             collate_fn=model_config.build_collator(
-                max_seq_len, self.pad, include_metadata=include_metadata),
+                self.sequence_length, self.pad, include_metadata=include_metadata),
             num_workers=self.num_workers,
             sampler=sampler,
             pin_memory=self.pin_memory,
@@ -141,19 +128,9 @@ class DataLoaderConfig(BaseConfig):
     ) -> DataLoader:
         if device is None:
             device = "cpu"
-
-        if self.pad is None:
-            max_seq_len = None
-        elif self.max_text_seq_len:
-            max_seq_len = self.max_text_seq_len + model_config.mm_preprocessor.get_max_mm_tokens(model_config.vision_backbone)
-            max_seq_len = ((max_seq_len + 8 - 1) // 8) * 8
-        else:
-            max_seq_len = self.sequence_length
-        preprocessor = model_config.build_preprocessor(
-            for_inference=False, is_training=True, max_seq_len=max_seq_len)
         if self.dataset:
-            ds = get_dataset_by_name(self.dataset, self.split)
-            datasets = [DeterministicDataset(ds, preprocessor, self.seed)]
+            datasets = [get_dataset_by_name(
+                self.dataset, self.split)]
             rates = [1]
         else:
             mixture: Dict[str, Tuple[Dataset, float, Optional[Dict]]] = {}
@@ -162,6 +139,7 @@ class DataLoaderConfig(BaseConfig):
                     log.info(f"Loading train dataset {name}/{self.split}")
                     mixture[name] = (get_dataset_by_name(name, self.split), rate)
             else:
+                mixture = {}
                 for root_size_mixture in self.root_size_mixture:
                     group_datasets = {}
                     for name, as_size in root_size_mixture.mixture.items():
@@ -188,8 +166,13 @@ class DataLoaderConfig(BaseConfig):
             names = list(x[0] for x in mixture)
             for ix in np.argsort(rates)[::-1]:
                 log.info(f"{names[ix]}: {100*rates[ix]:0.2f}")
+
+        max_seq_len = self.sequence_length if self.pad else None
+        preprocessor = model_config.build_preprocessor(
+            for_inference=False, is_training=True, max_seq_len=max_seq_len)
+        datasets = [DeterministicDataset(ds, preprocessor, self.seed) for ds in datasets]
+
         dataset = IterableDatasetMixture(
-            start_index=self.start_index,
             datasets=datasets,
             mixture_rates=rates,
             global_batch_size=global_batch_size,
@@ -201,11 +184,10 @@ class DataLoaderConfig(BaseConfig):
             batch_size=dataset.device_batch_size,
             drop_last=self.drop_last,
             collate_fn=model_config.build_collator(
-                max_seq_len, self.pad, include_metadata=False),
+                self.sequence_length, self.pad, include_metadata=False),
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             prefetch_factor=None if self.num_workers == 0 else self.prefetch_factor,
             persistent_workers=self.persistent_workers,
             timeout=self.timeout,
         )
-

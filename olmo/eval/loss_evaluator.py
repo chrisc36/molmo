@@ -1,5 +1,4 @@
 """Class to build metrics for a model based on the loss"""
-import dataclasses
 import logging
 from dataclasses import dataclass, field
 from itertools import islice
@@ -15,7 +14,6 @@ from wandb.sdk.data_types.base_types.wb_value import WBValue
 
 from olmo.config import BaseConfig, D
 from olmo.data.data_loader import DataLoaderConfig
-from olmo.eval.save_eval_data_config import SaveEvalDataConfig
 from olmo.models.molmo.molmo import MolmoConfig
 from olmo.torch_util import move_to_device, get_world_size
 
@@ -29,9 +27,9 @@ class LossMetrics:
 
     def __init__(self, device, collect_outputs=False):
         self.eval_metrics: Dict[str, MeanMetric] = dict(
-            CrossEntropyLoss=MeanMetric("error").to(device),
-            ZLoss=MeanMetric("error").to(device),
-            Accuracy=MeanMetric("error").to(device),
+            CrossEntropyLoss=MeanMetric("error", sync_on_compute=False).to(device),
+            ZLoss=MeanMetric("error", sync_on_compute=False).to(device),
+            Accuracy=MeanMetric("error", sync_on_compute=False).to(device),
         )
 
     def reset(self) -> None:
@@ -64,7 +62,7 @@ class LossMetrics:
         if zloss is not None:
             self.eval_metrics["ZLoss"].update(zloss/total_weight, total_weight)
         self.eval_metrics["Accuracy"].update(accuracy/total_weight, total_weight)
-        if model_out.metrics is not None:
+        if hasattr(model_out, "metrics") and model_out.metrics is not None:
             for name, val in model_out.metrics.items():
                 if name not in self.eval_metrics:
                     self.eval_metrics[name] = MeanMetric("error").to(cross_entropy_loss.device)
@@ -73,9 +71,24 @@ class LossMetrics:
                         self.eval_metrics[name].update(val[0]/val[1], val[1])
                     else:
                         self.eval_metrics[name].update(val, 1)
-                except Exception as e:
-                    e.add_note(f"Error processing metric {name}")
-                    raise e
+    
+    def update_hf(
+        self,
+        batch: Dict[str, torch.Tensor],
+        model_out,
+        cross_entropy_loss: torch.Tensor,
+        zloss: torch.Tensor
+    ) -> None:
+        loss_masks = batch["loss_masks"][..., 1:]
+        total_weight = loss_masks.sum().item()
+        labels = batch["labels"][..., 1:]
+        pred = torch.argmax(model_out.logits[..., :-1, :], dim=-1)
+        accuracy = ((pred.flatten() == labels.flatten()).float() * loss_masks.flatten()).sum().item()
+        accuracy /= total_weight
+        self.eval_metrics["CrossEntropyLoss"].update(cross_entropy_loss, 1)
+        if zloss is not None:
+            self.eval_metrics["ZLoss"].update(zloss, 1)
+        self.eval_metrics["Accuracy"].update(accuracy, 1)
 
 
 @dataclass
@@ -87,7 +100,6 @@ class LossDatasetEvaluator:
     num_batches: Optional[int] = None
     console_log_interval: Optional[int] = None
     z_loss: Optional[float] = None
-    save_data: Optional[SaveEvalDataConfig] = None
 
     def run(self, model, device, autocast_precision, loss_fn=None, pbar=False):
         # Reset metrics.
@@ -108,14 +120,14 @@ class LossDatasetEvaluator:
             eval_batches = islice(eval_batches, num_eval_batches)
 
         # Run model over batches.
-        viz_data = []
         with torch.inference_mode():
             for eval_step, batch in enumerate(tqdm(eval_batches, total=num_eval_batches, disable=not pbar)):
                 batch = move_to_device(batch, device)
                 response_mask = (batch["loss_masks"] > 0)
                 with torch.autocast("cuda", enabled=True, dtype=autocast_precision):
-                    inputs = {k: v for k, v in batch.items() if k not in ["labels", "loss_masks", "metadata"]}
-                    model_out = model(**inputs, response_mask=response_mask)
+                    model_out = model(
+                        **{k: v for k, v in batch.items() if k not in ["labels", "loss_masks", "metadata"]},
+                        response_mask=response_mask)
                 logits = model_out.logits
                 loss_masks = batch["loss_masks"]
                 loss_masks = loss_masks * (loss_masks > 0)
@@ -127,38 +139,44 @@ class LossDatasetEvaluator:
                     logits_for_loss, labels, ignore_index=-100, reduction="none",
                     compute_z_loss=self.z_loss is not None, z_loss_scale=self.z_loss,
                 )
-                token_ce_loss = ce_loss.reshape(batch["loss_masks"].shape)
                 ce_loss = (ce_loss * loss_masks.view(-1)).sum()
                 if z_loss is not None:
                     z_loss = (z_loss * loss_masks.view(-1)).sum()
                 self.evaluator.update(batch, model_out, ce_loss, z_loss)
 
-                # Maybe save internal data
-                if self.save_data:
-                    for i in range(len(response_mask)):
-                        saved_data = {}
-                        if self.save_data.save_token_losses:
-                            saved_data["token_losses"] = token_ce_loss[i].detach().cpu()
-                        if self.save_data.save_example_losses:
-                            saved_data["example_loss"] = ((token_ce_loss[i] * loss_masks[i]).sum() / loss_masks[i].sum()).detach().cpu()
-                        if self.save_data.example_metadata:
-                            saved_data["example_metadata"] = batch["metadata"][i]
-                        if self.save_data.post_processed_inputs:
-                            saved_data["post_processed_inputs"] = {k: v[i].detach().cpu() for k, v in inputs.items()}
-                            saved_data["post_processed_inputs"]["loss_masks"] = batch["loss_masks"][i].detach().cpu()
-                            saved_data["post_processed_inputs"]["labels"] = batch["labels"][i].detach().cpu()
-                        if self.save_data.model_internal_data and model_out.internal is not None:
-                            saved_data["model_internal_data"] = {k: (None if v is None else v[i].detach().cpu()) for k, v in model_out.internal.items()}
-                        viz_data.append(saved_data)
+                if self.console_log_interval and not pbar:
+                    if eval_step + 1 == num_eval_batches or (eval_step + 1) % self.console_log_interval == 0:
+                        log.info(f"[eval_step={eval_step + 1}/{num_eval_batches}]")
+        return self.evaluator.compute()
+
+    def run_hf(self, model, processor, device, autocast_precision, loss_fn=None, pbar=True):
+        self.evaluator.reset()
+        # Initialize data loader iterator.
+        eval_batches = iter(self.eval_loader)
+
+        # Adjust how many batches to evaluate on.
+        num_eval_batches = self.num_batches
+        if num_eval_batches > 0:
+            if isinstance(self.eval_loader, torch.utils.data.IterableDataset):
+                num_eval_batches = None  # No defined length
+            else:
+                num_eval_batches = min(num_eval_batches, len(self.eval_loader))
+            eval_batches = islice(eval_batches, num_eval_batches)
+
+        # Run model over batches.
+        with torch.inference_mode():
+            for eval_step, batch in enumerate(tqdm(eval_batches, total=num_eval_batches, disable=not pbar)):
+                batch = move_to_device(batch, device)
+                response_mask = (batch["loss_masks"] > 0)
+                with torch.autocast("cuda", enabled=True, dtype=autocast_precision):
+                    model_out = model(
+                        **batch, return_dict=True)
+                self.evaluator.update_hf(batch, model_out, model_out.loss.item(), model_out.aux_loss[0].item() if model_out.aux_loss[0] is not None else 0)
 
                 if self.console_log_interval and not pbar:
                     if eval_step + 1 == num_eval_batches or (eval_step + 1) % self.console_log_interval == 0:
                         log.info(f"[eval_step={eval_step + 1}/{num_eval_batches}]")
-        if self.save_data:
-            return self.evaluator.compute(), viz_data
-        else:
-            return self.evaluator.compute()
-
+        return self.evaluator.compute()
 
 @dataclass
 class LossDatasetEvaluatorConfig(BaseConfig):
@@ -191,11 +209,9 @@ class LossDatasetEvaluatorConfig(BaseConfig):
             config.data = DataLoaderConfig.update_legacy_settings(config.data)
         return config
 
-    def build_dataset_evaluator(self, model_config: MolmoConfig, device, save_data: SaveEvalDataConfig=None) -> LossDatasetEvaluator:
+    def build_dataset_evaluator(self, model_config: MolmoConfig, device) -> LossDatasetEvaluator:
         eval_loader = self.data.build_eval_dataloader(
-            model_config, self.device_batch_size, for_inference=False,
-            include_metadata=save_data and save_data.example_metadata
-        )
+            model_config, self.device_batch_size, for_inference=False)
         if self.max_examples is not None:
             num_batches = max(1, self.max_examples // (self.device_batch_size*get_world_size()))
         elif self.subset_num_batches is not None:
@@ -208,6 +224,23 @@ class LossDatasetEvaluatorConfig(BaseConfig):
             eval_loader=eval_loader,
             evaluator=LossMetrics(device),
             num_batches=num_batches,
-            console_log_interval=self.console_log_interval,
-            save_data=save_data
+            console_log_interval=self.console_log_interval
+        )
+    
+    def build_hf_dataset_evaluator(self, processor, device, **kwargs) -> LossDatasetEvaluator:
+        eval_loader = self.data.build_eval_dataloader(
+            self.device_batch_size, preprocessor=processor, for_inference=False)
+        if self.max_examples is not None:
+            num_batches = max(1, self.max_examples // (self.device_batch_size*get_world_size()))
+        elif self.subset_num_batches is not None:
+            num_batches = self.subset_num_batches
+        else:
+            num_batches = len(eval_loader)
+
+        return LossDatasetEvaluator(
+            label=self.label,
+            eval_loader=eval_loader,
+            evaluator=LossMetrics(device),
+            num_batches=num_batches,
+            console_log_interval=self.console_log_interval
         )
