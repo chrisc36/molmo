@@ -3,14 +3,14 @@ from olmo.data.academic_datasets import (
     TabWMPDirectAnswer,
     AndroidControl, AI2D, CountBenchQa, RealWorldQa, MathVista, MMMU, ClockBench
 )
-from olmo.data.academic_datasets_manual import (
+from olmo.data.academic_datasets import (
     ChartQa, InfoQa, SceneTextQa, DocQa,
     TextVqa, AOkVqa, Vqa2, PlotQa, TallyQa, FigureQa, DvQa,
 )
 from olmo.data.dataset import Dataset
 from olmo.data.pixmo_datasets import (
     PixMoDocs, PixMoCount, PixMoPoints, PixMoCapQa, PixMoCap, PixMoPointExplanations,
-    PixMoAskModelAnything, PixMoPointsEval, DenseCaptionEval, PixMoClocks,
+    PixMoAskModelAnything, PixMoPointsEval,
     CoSyn, CoSynPoint
 )
 import itertools
