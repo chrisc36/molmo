@@ -15,7 +15,6 @@ from tqdm import tqdm
 from .evaluators import (
     HtmlTable, CountEval, PointCountEval, PointingEval, ClockEval, VqaEval,
     SavePredictions, AndroidControlEval, MathVistaEval, PointingEval,
-    TempCompassEval, VideoMMEEval, MLVUGenEval, LongVideoBenchEval
 )
 from ..config import BaseConfig
 from ..data.data_loader import DataLoaderConfig
@@ -81,16 +80,6 @@ class InfEvaluator:
                 counting_scores = {k: resolved_metrics[k] for
                                    k in list(resolved_metrics.keys()) if k.startswith("correct_")}
                 resolved_metrics["per_category_average"] = np.mean(list(counting_scores.values()))
-            elif isinstance(metric, MLVUGenEval):
-                # MLVU has a macro-score that should be computed once we have
-                # scores from all devices
-                mlvu_sub_scene_scores = {k: resolved_metrics[k] for
-                                         k in list(resolved_metrics.keys()) if k.startswith("sub_scene_")}
-                resolved_metrics["sub_scene_total"] = np.sum(list(mlvu_sub_scene_scores.values()))
-                mlvu_summary_scores = {k: resolved_metrics[k] for
-                                      k in list(resolved_metrics.keys()) if k.startswith("summary_")}
-                resolved_metrics["summary_total"] = np.sum(list(mlvu_summary_scores.values()))
-                resolved_metrics["mlvu_gen_total"] = np.mean([resolved_metrics["sub_scene_total"], resolved_metrics["summary_total"]])
         return resolved_metrics
 
 
@@ -121,14 +110,6 @@ class EvaluatorConfig(BaseConfig):
     clock_eval: bool = False
     clock_bench_eval: bool = False # Clock reading benchmark, coco/openimg/movies
     math_vista_eval: bool = False
-    temp_compass_eval: str = ''
-    """TempCompass tasks to run evaluation on, either one of the tasks or 'all'"""
-    temp_compass_disable_api: bool = False
-    """Whether not to use ChatGPT evaluation for TempCompass"""
-    video_mme_eval: str = ''
-    """VideoMME tasks to run evaluation on, either one of the tasks or 'all'"""
-    mlvu_gen_eval: bool = False
-    long_video_bench_eval: bool = False
 
     def build(self, default_save_dir=None) -> InfEvaluator:
         evaluators = []
@@ -159,14 +140,6 @@ class EvaluatorConfig(BaseConfig):
             evaluators.append(CountEval(self.num_wandb_examples))
         elif self.android_eval:
             evaluators.append(AndroidControlEval(self.num_wandb_examples))
-        elif self.temp_compass_eval:
-            evaluators.append(TempCompassEval(self.temp_compass_eval, self.temp_compass_disable_api, self.num_wandb_examples))
-        elif self.video_mme_eval:
-            evaluators.append(VideoMMEEval(self.video_mme_eval, self.num_wandb_examples))
-        elif self.mlvu_gen_eval:
-            evaluators.append(MLVUGenEval(self.num_wandb_examples))
-        elif self.long_video_bench_eval:
-            evaluators.append(LongVideoBenchEval(self.num_wandb_examples))
         if self.pointing_eval:
             evaluators.append(PointingEval(self.num_wandb_examples))
         else:

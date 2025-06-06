@@ -66,12 +66,8 @@ class LossMetrics:
             for name, val in model_out.metrics.items():
                 if name not in self.eval_metrics:
                     self.eval_metrics[name] = MeanMetric("error").to(cross_entropy_loss.device)
-                try:
-                    if isinstance(val, tuple):
-                        self.eval_metrics[name].update(val[0]/val[1], val[1])
-                    else:
-                        self.eval_metrics[name].update(val, 1)
-    
+                self.eval_metrics[name].update(val, 1)
+
     def update_hf(
         self,
         batch: Dict[str, torch.Tensor],
