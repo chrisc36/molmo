@@ -66,17 +66,9 @@ class LossMetrics:
         self.eval_metrics["Accuracy"].update(accuracy/total_weight, total_weight)
         if hasattr(model_out, "metrics") and model_out.metrics is not None:
             for name, val in model_out.metrics.items():
-                if name in ["HighResSelection", "HighResVals"]:
-                    if name not in self.eval_metrics:
-                        self.eval_metrics[name] = torchmetrics.CatMetric("error")
-                    self.eval_metrics[name].update(val)
-                else:
-                    if name not in self.eval_metrics:
-                        self.eval_metrics[name] = MeanMetric("error").to(cross_entropy_loss.device)
-                    if isinstance(val, tuple):
-                        self.eval_metrics[name].update(val[0]/val[1], val[1])
-                    else:
-                        self.eval_metrics[name].update(val, 1)
+                if name not in self.eval_metrics:
+                    self.eval_metrics[name] = MeanMetric("error").to(cross_entropy_loss.device)
+                self.eval_metrics[name].update(val, 1)
     
     def update_hf(
         self,
