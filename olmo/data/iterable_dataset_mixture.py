@@ -33,6 +33,7 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
             self.mixture_rates = np.array(mixture_rates, dtype=np.float32)
         else:
             self.mixture_rates = None
+            assert len(datasets) == 1
 
         self.seed = seed
         assert seed is not None
@@ -47,11 +48,11 @@ class IterableDatasetMixture(torch.utils.data.IterableDataset[Dict[str, Any]]):
         self.worker_info = worker_info  # For testing
 
     def __len__(self):
-        if self.mixture_rates is not None:
-            return int(np.ceil(sum(len(d) * r for d, r in zip(self.datasets, self.mixture_rates))))
+        if len(self.datasets) == 1:
+            return len(self.datasets[0])
         else:
-            return int(np.ceil(sum(len(d) for d in self.datasets)))
-    
+            raise TypeError("Mixtures do not have a well-defined length")
+
     def _get_next_sources(self, rng, counts):
         if len(self.datasets) == 1:
             return np.zeros(self.global_batch_size, dtype=np.int32)

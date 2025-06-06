@@ -9,7 +9,7 @@ from tqdm import tqdm
 from typing import List, Optional, Union, Any, Tuple, Iterable, Set
 
 import PIL
-from PIL import ImageFile, ImageOps
+from PIL import ImageFile, ImageOps, Image
 
 from olmo.data.dataset import DATA_HOME
 from olmo.io import get_bytes_range, write_file, file_exists
@@ -32,25 +32,6 @@ from transformers.image_utils import (
     ImageInput,
 )
 
-from olmo.models.molmo.data_formatter import DataFormatter
-
-DEFAULT_IMAGE_PATH = "/weka/oe-training-default/mm-olmo/torch_datasets"
-
-
-def load_pil_image(image_path: str) -> PIL.Image.Image:
-    setup_pil()  # Call here so the setting is applied in multi-processing contexts
-    # This a bit of hack to handle cases where the image path was hard-coded
-    # into the dataset to the weka path
-    if DATA_HOME != DEFAULT_IMAGE_PATH and DEFAULT_IMAGE_PATH in image_path:
-        image_path = image_path.replace(DEFAULT_IMAGE_PATH, DATA_HOME)
-    # Ignore image loading warning
-    with warnings.catch_warnings(record=True) as w:
-        if image_path.startswith("gs://"):
-            image_bytes = get_bytes_range(image_path, 0, None)
-            return PIL.Image.open(BytesIO(image_bytes))
-        else:
-            return PIL.Image.open(image_path)
-
 
 def load_image(image_path):
     setup_pil()  # Call here so the setting is applied in multi-processing contexts
@@ -71,6 +52,8 @@ def load_image(image_path):
     else:
         # This a bit of hack to handle cases where the image path was hard-coded
         # into the dataset to the weka path
+        # FIXME remove this hack!!!
+        DEFAULT_IMAGE_PATH = "/weka/oe-training-default/mm-olmo/torch_datasets"
         if DATA_HOME != DEFAULT_IMAGE_PATH and DEFAULT_IMAGE_PATH in image_path:
             image_path = image_path.replace(DEFAULT_IMAGE_PATH, DATA_HOME)
 
@@ -220,12 +203,7 @@ def siglip_resize_and_pad(
     image: np.ndarray,
     desired_output_size: Tuple[int, int],
 ) -> Tuple[np.ndarray, np.ndarray]:
-    if len(image.shape) == 3:
-        is_video = False
-        image = torch.permute(torch.from_numpy(image), [2, 0, 1])
-    else:
-        is_video = True
-        image = torch.permute(torch.from_numpy(image), [0, 3, 1, 2])
+    image = torch.permute(torch.from_numpy(image), [2, 0, 1])
     dtype = image.dtype
     if torch.is_floating_point(image):
         in_min = 0.0
@@ -250,12 +228,8 @@ def siglip_resize_and_pad(
     resized = resized.to(torch.float32)
     resized = (resized - in_min) / (in_max - in_min)
 
-    if is_video:
-        resized = torch.permute(resized, [0, 2, 3, 1]).numpy()
-        image_mask = None
-    else:
-        resized = torch.permute(resized, [1, 2, 0]).numpy()
-        image_mask = np.ones_like(resized[:, :, 0], dtype=np.bool_)
+    resized = torch.permute(resized, [1, 2, 0]).numpy()
+    image_mask = np.ones_like(resized[:, :, 0], dtype=np.bool_)
 
     return resized, image_mask
 
@@ -335,6 +309,15 @@ class ImagePreprocessor:
     base_image_input_size: Tuple[int, int] = (336, 336)
     image_patch_size: int = 14
 
+    def unnormalize_image(self, image: np.ndarray):
+        if self.normalize == "openai":
+            return (image * np.array(OPENAI_CLIP_STD, dtype=np.float32)[None, None, :] +
+                    np.array(OPENAI_CLIP_MEAN, dtype=np.float32)[None, None, :])
+        elif self.normalize == "siglip":
+            return (image + 1) / np.asarray(2.0, dtype=np.float32)
+        else:
+            raise NotImplementedError()
+
     def normalize_image(self, image):
         if self.normalize == "openai":
             image -= np.array(OPENAI_CLIP_MEAN, dtype=np.float32)[None, None, :]
@@ -361,14 +344,16 @@ class ImagePreprocessor:
                 image, output_size, pad_value=self.pad_value, rng=rng, is_training=is_training,
                 resize_method=resize)
 
-    def build_resized_image(self, image, is_training, rng):
-        resized, resized_mask = self.resize_image(image, self.base_image_input_size, is_training, rng)
-        resized = self.normalize_image(resized)
+    def build_resized_image(self, image, is_training, rng, image_size=None, normalize=True):
+        image_size = image_size or self.base_image_input_size
+        resized, resized_mask = self.resize_image(image, image_size, is_training, rng)
+        if normalize:
+            resized = self.normalize_image(resized)
         if len(resized.shape) == 3:
             resized = np.expand_dims(resized, 0)
         resized_mask = np.expand_dims(resized_mask, 0)
-        crop_patch_w = self.base_image_input_size[1] // self.image_patch_size
-        crop_patch_h = self.base_image_input_size[0] // self.image_patch_size
+        crop_patch_w = image_size[1] // self.image_patch_size
+        crop_patch_h = image_size[0] // self.image_patch_size
         resize_idx = np.arange(crop_patch_w*crop_patch_h).reshape([crop_patch_h, crop_patch_w])
         return resized, resized_mask, resize_idx
 
