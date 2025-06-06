@@ -133,8 +133,8 @@ class DataLoaderConfig(BaseConfig):
                 self.dataset, self.split)]
             rates = [1]
         else:
+            mixture: Dict[str, Tuple[Dataset, float, Optional[Dict]]] = {}
             if self.mixture:
-                mixture = {}
                 for name, rate in self.mixture.items():
                     log.info(f"Loading train dataset {name}/{self.split}")
                     mixture[name] = (get_dataset_by_name(name, self.split), rate)
@@ -159,7 +159,9 @@ class DataLoaderConfig(BaseConfig):
             total_rate = sum(x[1] for x in mixture.values())
             mixture = sorted(mixture.items(), key=lambda x: x[0])
             rates = [rate/total_rate for (_, (_, rate)) in mixture]
-            datasets = [ds for (_, (ds, _)) in mixture]
+            datasets = []
+            for _, (dataset, _) in mixture:
+                datasets.append(DeterministicDataset(dataset, preprocessor, self.seed))
             log.info("Sampling rates:")
             names = list(x[0] for x in mixture)
             for ix in np.argsort(rates)[::-1]:

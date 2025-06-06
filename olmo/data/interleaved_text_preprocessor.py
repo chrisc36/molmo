@@ -3,7 +3,6 @@ import math
 from typing import Optional, Any, List, Union, Dict
 
 import numpy as np
-from olmo import tokenizer
 
 
 ATTEND_ALL_SUBSEGMENT_ID = 10000
